@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated BEVFusion artifacts and external resources
+tests/
+outputs/
+output/
+data/
+checkpoints/
+*.pth
+*.pt
+
