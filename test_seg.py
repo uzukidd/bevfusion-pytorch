@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from bevfusion import BEVFusion
+from bevfusion import BEVFusionSeg
 
 
 def main():
@@ -33,6 +33,8 @@ def main():
     parser.add_argument("--save-inputs", type=Path, help="Optional new .pt file to save loaded sensor/calibration tensors")
     parser.add_argument("--head-checkpoint", type=Path,
                         help="Optional trained four-class head paired with the original base checkpoint")
+    parser.add_argument("--backend", choices=("reference", "auto", "cuda"), default="reference",
+                        help="Shared operator backend; auto uses installed packages on CUDA")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, help="Optional output .pt containing probabilities and class names")
     parser.add_argument("--save-model", type=Path, help="Optional new file: complete model including bound calibration")
@@ -73,8 +75,8 @@ def main():
                    if key in sample}
 
     # 1. Load all model modules and optionally bind camera calibration once.
-    model = BEVFusion.from_pretrained(args.checkpoint, head_checkpoint=args.head_checkpoint,
-                                     device=args.device, **calibration)
+    model = BEVFusionSeg.from_pretrained(args.checkpoint, head_checkpoint=args.head_checkpoint,
+                                        device=args.device, backend=args.backend, **calibration)
     if model._camera_intrinsics is None or model._camera2lidar is None:
         parser.error("Camera calibration is required. Put calibration.json in --samples, pass --calibration, "
                      "or load a complete model with matching calibration already bound.")
@@ -112,7 +114,7 @@ def main():
         import matplotlib.pyplot as plt
 
         figure_path = args.figure or Path("outputs/visualizations") / (
-            input_name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".png")
+            "seg_" + input_name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".png")
         figure = plot_prediction(sample["images"], sample["points"], probabilities, model.classes,
                                  camera_names=sample.get("camera_names"), threshold=args.threshold,
                                  save_path=figure_path, show=False)

@@ -1,17 +1,37 @@
 # Minimal BEVFusion in PyTorch
 
+## Requirements
+
+- pytorch
+- cuda
+- onnxruntime
+
 ## Usages
 
 1. Download the official checkpoint from https://github.com/mit-han-lab/bevfusion/tree/main and save it to `data\checkpoints`.
 2. Run the following command to launch the demo:
 
+or
+
 ```bash
-python .\test.py --checkpoint data/checkpoints/bevfusion-seg.pth --samples data/samples
+.\scripts\test_bevfusion_det.bat --checkpoint data/checkpoints/bevfusion-det.pth --samples data/samples --config config/convfuser.yaml --device cuda --backend auto --no-show 
+```
+
+or
+
+```bash
+.\scripts\test_bevfusion_seg.bat --checkpoint data/checkpoints/bevfusion-seg.pth --samples data/samples --device cuda --backend auto --no-show
 ```
 
 See `.\test.py` for more details.
 
 ## Supported checkpoints
+
+### 3D Object Detection (on nuScenes )
+
+| Model                                                        | Modality | Checkpoint                                                   |
+| ------------------------------------------------------------ | -------- | ------------------------------------------------------------ |
+| [BEVFusion](https://github.com/mit-han-lab/bevfusion/blob/main/configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml) | C+L      | [Link](https://www.dropbox.com/scl/fi/ulaz9z4wdwtypjhx7xdi3/bevfusion-det.pth?rlkey=ovusfi2rchjub5oafogou255v&dl=1) |
 
 ### BEV Map Segmentation (on nuScenes)
 

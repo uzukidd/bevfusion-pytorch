@@ -1,6 +1,7 @@
-"""Inference-only sparse convolution reference backend for the legacy checkpoint.
-Uses PyTorch CUDA gather/GEMM and preserves legacy [kx,ky,kz,in,out] weights.
-No third-party sparse extensions, and no modification of upstream sources.
+"""Shared inference sparse encoder preserving legacy [kx,ky,kz,in,out] weights.
+
+The reference backend uses Torch gather/GEMM; CUDA/auto use the separately
+installed spconv extension with the same parameter tensors and checkpoint keys.
 """
 from dataclasses import dataclass, field
 from itertools import product
@@ -36,6 +37,44 @@ class ReferenceSparseConv(nn.Module):
         self.subm = subm
         self.weight = nn.Parameter(torch.empty(*self.kernel, cin, cout))
 
+    def _forward_cuda(self, state):
+        from ops.spconv import ops as sparse_ops
+        from ops.spconv import functional as sparse_functional
+
+        out_shape = state.shape if self.subm else tuple(
+            (s + 2 * p - k) // st + 1
+            for s, p, k, st in zip(state.shape, self.padding, self.kernel, self.stride)
+        )
+        if not self.subm:
+            # The legacy extension cannot launch its second pass when all
+            # input sites fall outside every output kernel (N == 0).
+            coordinate = state.coords
+            stride = coordinate.new_tensor(self.stride)
+            kernel = coordinate.new_tensor(self.kernel)
+            shifted = coordinate + coordinate.new_tensor(self.padding)
+            first = torch.div(shifted - kernel + stride, stride, rounding_mode="floor").clamp_min(0)
+            last = torch.minimum(torch.div(shifted, stride, rounding_mode="floor"),
+                                 coordinate.new_tensor(out_shape) - 1)
+            if not ((first <= last).all(1)).any():
+                return SparseState(state.features.new_zeros((0, self.weight.shape[-1])),
+                                   coordinate.new_empty((0, 3)), out_shape)
+        cache_key = ("cuda", self.kernel, self.stride, self.padding, self.subm)
+        if self.subm and cache_key in state.cache:
+            out_coords, pairs, counts = state.cache[cache_key]
+        else:
+            coordinates = F.pad(state.coords, (1, 0)).int().contiguous()
+            outids, pairs, counts = sparse_ops.get_indice_pairs(
+                coordinates, 1, list(state.shape), self.kernel, self.stride,
+                self.padding, (1, 1, 1), (0, 0, 0), self.subm, False,
+            )
+            out_coords = outids[:, 1:].long()
+            if self.subm:
+                state.cache[cache_key] = (out_coords, pairs, counts)
+        operation = sparse_functional.indice_subm_conv if self.subm else sparse_functional.indice_conv
+        result = operation(state.features.contiguous(), self.weight.contiguous(),
+                           pairs.to(state.features.device), counts, len(out_coords))
+        return SparseState(result, out_coords, out_shape, state.cache if self.subm else {})
+
     def forward(self, state):
         if state.features.shape[0] == 0:
             out_shape = state.shape if self.subm else tuple(
@@ -48,6 +87,14 @@ class ReferenceSparseConv(nn.Module):
                 state.cache if self.subm else {},
             )
         device = state.features.device
+        backend = getattr(self, "backend", "reference")
+        if backend == "cuda" and device.type != "cuda":
+            raise ValueError("The cuda backend requires CUDA tensors")
+        if device.type == "cuda" and backend in ("auto", "cuda"):
+            try:
+                return self._forward_cuda(state)
+            except (ImportError, OSError) as exc:
+                raise RuntimeError("Install bevfusion-spconv-ops with scripts/install_ops.bat") from exc
         stride = torch.tensor(self.stride, device=device)
         # Legacy submanifold conv fixes the centre at kernel//2, independent of declared padding.
         pad_tuple = tuple(k // 2 for k in self.kernel) if self.subm else self.padding
@@ -128,8 +175,13 @@ def convmodule(cin,cout,kernel=3,stride=1,padding=0,subm=False):
 
 
 class ReferenceSparseEncoder(nn.Module):
-    def __init__(self):
+    """Shared checkpoint-compatible encoder with reference or installed CUDA ops."""
+    def __init__(self, sparse_shape=(1024, 1024, 41), backend="reference"):
         super().__init__()
+        if backend not in ("reference", "cuda", "auto"):
+            raise ValueError("backend must be reference, cuda or auto")
+        self.sparse_shape = tuple(sparse_shape)
+        self.backend = backend
         self.conv_input=convmodule(5,16,padding=1,subm=True)
         self.encoder_layers=SparseSequence()
         for index,channels in enumerate((16,32,64,128)):
@@ -138,11 +190,14 @@ class ReferenceSparseEncoder(nn.Module):
                 blocks.append(convmodule(channels,channels*2,stride=2,padding=(1,1,0) if index==2 else 1))
             self.encoder_layers.add_module(f'encoder_layer{index+1}',SparseSequence(*blocks))
         self.conv_out=convmodule(128,128,kernel=(1,1,3),stride=(1,1,2))
+        for module in self.modules():
+            if isinstance(module, ReferenceSparseConv):
+                module.backend = backend
 
     def forward(self,features,coords,verbose=True):
         if features.shape[0] == 0:
-            return features.new_zeros((1, 256, 128, 128))
-        state=SparseState(features,coords.long(),(1024,1024,41))
+            return features.new_zeros((1, 256, self.sparse_shape[0] // 8, self.sparse_shape[1] // 8))
+        state=SparseState(features,coords.long(),self.sparse_shape)
         start=time.perf_counter()
         state=self.conv_input(state)
         if verbose: print('SPARSE input',len(state.coords),flush=True)

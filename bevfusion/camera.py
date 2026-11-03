@@ -217,8 +217,11 @@ class GeneralizedLSSFPN(nn.Module):
 
 
 class LSSTransform(nn.Module):
-    def __init__(self, image_size=(256, 704), pool_depth_chunk=16):
+    def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference"):
         super().__init__()
+        if pool_backend not in ("reference", "cuda", "auto"):
+            raise ValueError("pool_backend must be reference, cuda or auto")
+        self.pool_backend = pool_backend
         self.image_size = tuple(image_size)
         self.feature_size = tuple(s // 8 for s in image_size)
         self.C, self.D = 80, 118
@@ -263,6 +266,24 @@ class LSSTransform(nn.Module):
         coords = coords.reshape(-1, 3)
         valid = ((coords >= 0) & (coords < self.nx)).all(-1)
         coords = coords[valid]
+        backend = getattr(self, "pool_backend", "reference")
+        if backend == "cuda" and not values.is_cuda:
+            raise ValueError("The cuda pooling backend requires CUDA tensors")
+        if values.is_cuda and backend in ("auto", "cuda"):
+            if not len(coords):
+                return
+            try:
+                from ops.bev_pool import bev_pool
+            except (ImportError, OSError) as exc:
+                raise RuntimeError("Install bevfusion-bev-pool-ops with scripts/install_ops.bat") from exc
+            # Each chunk is one camera of one batch: use a local batch index
+            # and accumulate the CUDA B,C,Z,X,Y result into the shared layout.
+            coordinates = F.pad(coords, (0, 1)).int().contiguous()
+            pooled = bev_pool(values.reshape(-1, self.C)[valid].float().contiguous(),
+                              coordinates, 1, nz, nx, ny)
+            start = batch_index * nz * nx * ny
+            out[start:start + nz * nx * ny] += pooled.permute(0, 2, 3, 4, 1).reshape(-1, self.C)
+            return
         # Original CUDA output is B,C,Z,X,Y: X is the first spatial axis.
         ranks = ((batch_index * nz + coords[:, 2]) * nx + coords[:, 0]) * ny + coords[:, 1]
         out.index_add_(0, ranks, values.reshape(-1, self.C)[valid].float())
@@ -306,9 +327,11 @@ class LSSTransform(nn.Module):
 
 
 class NativeCameraEncoder(nn.ModuleDict):
-    def __init__(self, camera_batch_size=1, pool_depth_chunk=16):
+    def __init__(self, camera_batch_size=1, pool_depth_chunk=16, *, vtransform=None,
+                 pool_backend="reference"):
         super().__init__({"backbone": SwinTransformer(), "neck": GeneralizedLSSFPN(),
-                          "vtransform": LSSTransform(pool_depth_chunk=pool_depth_chunk)})
+                          "vtransform": vtransform if vtransform is not None else LSSTransform(
+                              pool_depth_chunk=pool_depth_chunk, pool_backend=pool_backend)})
         self.camera_batch_size = camera_batch_size
 
     def encode_images(self, images):
