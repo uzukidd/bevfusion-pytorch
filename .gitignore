@@ -223,7 +223,7 @@ __marimo__/
 tests/
 outputs/
 output/
-data/
+data/checkpoints
 checkpoints/
 *.pth
 *.pt

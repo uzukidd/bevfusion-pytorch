@@ -1,0 +1,4 @@
+include LICENSE
+include pyproject.toml
+recursive-include src *.cc *.cu
+recursive-include include *.h

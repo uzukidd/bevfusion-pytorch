@@ -3,6 +3,7 @@
 Only the example reads files. The BEVFusion forward method accepts tensors only.
 """
 import argparse
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -78,12 +79,15 @@ def main():
         parser.error("Camera calibration is required. Put calibration.json in --samples, pass --calibration, "
                      "or load a complete model with matching calibration already bound.")
     # 2. The actual model invocation needs only the two sensor tensors.
+    started = time.perf_counter()
     with torch.inference_mode():
         probabilities = model(sample["images"], sample["points"])
 
+    elapsed = time.perf_counter() - started
     print("classes:", model.classes)
     print("probabilities:", tuple(probabilities.shape), probabilities.dtype, probabilities.device)
     print("range:", float(probabilities.min()), float(probabilities.max()))
+    print(f"inference time: {elapsed:.3f} s")
     print("grid: [batch,class,increasing_X,increasing_Y], 200x200, 0.5 m/cell, XY in [-50,50)")
     if args.save_inputs:
         args.save_inputs.parent.mkdir(parents=True, exist_ok=True)

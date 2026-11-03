@@ -2,3 +2,4 @@ torch>=2.1
 numpy>=1.24
 Pillow>=10
 matplotlib>=3.7
+onnxruntime>=1.18
