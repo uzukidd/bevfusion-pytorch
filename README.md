@@ -4,24 +4,30 @@
 
 - pytorch
 - cuda
-- onnxruntime
+- matplotlib
+- onnxruntime (optional)
 
 ## Usages
 
 1. Download the official checkpoint from https://github.com/mit-han-lab/bevfusion/tree/main and save it to `data\checkpoints`.
-2. Run the following command to launch the demo:
 
-or
+2. Run the following command to compile and install the operators:
 
-```bash
-.\scripts\test_bevfusion_det.bat --checkpoint data/checkpoints/bevfusion-det.pth --samples data/samples --config config/convfuser.yaml --device cuda --backend auto --no-show 
-```
+    ```bash
+    .\scripts\test_onnx.bat
+    ```
 
-or
+3. Run the following command to launch the demo:
 
-```bash
-.\scripts\test_bevfusion_seg.bat --checkpoint data/checkpoints/bevfusion-seg.pth --samples data/samples --device cuda --backend auto --no-show
-```
+    ```bash
+    .\scripts\test_bevfusion_det.bat --checkpoint data/checkpoints/bevfusion-det.pth --samples data/samples --config config/convfuser.yaml --device cuda --backend auto --no-show 
+    ```
+
+	or
+
+    ```bash
+    .\scripts\test_bevfusion_seg.bat --checkpoint data/checkpoints/bevfusion-seg.pth --samples data/samples --device cuda --backend auto --no-show
+    ```
 
 See `.\test.py` for more details.
 
@@ -29,15 +35,15 @@ See `.\test.py` for more details.
 
 ### 3D Object Detection (on nuScenes )
 
-| Model                                                        | Modality | Checkpoint                                                   |
-| ------------------------------------------------------------ | -------- | ------------------------------------------------------------ |
-| [BEVFusion](https://github.com/mit-han-lab/bevfusion/blob/main/configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml) | C+L      | [Link](https://www.dropbox.com/scl/fi/ulaz9z4wdwtypjhx7xdi3/bevfusion-det.pth?rlkey=ovusfi2rchjub5oafogou255v&dl=1) |
+| Model                                                        | Modality | Inference time | Checkpoint                                                   |
+| ------------------------------------------------------------ | -------- | -------------- | ------------------------------------------------------------ |
+| [BEVFusion](https://github.com/mit-han-lab/bevfusion/blob/main/configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml) | C+L      | ~107ms         | [Link](https://www.dropbox.com/scl/fi/ulaz9z4wdwtypjhx7xdi3/bevfusion-det.pth?rlkey=ovusfi2rchjub5oafogou255v&dl=1) |
 
 ### BEV Map Segmentation (on nuScenes)
 
-| Model                                                        | Modality | Checkpoint                                                   |
-| ------------------------------------------------------------ | -------- | ------------------------------------------------------------ |
-| [BEVFusion](https://github.com/mit-han-lab/bevfusion/blob/main/configs/nuscenes/seg/fusion-bev256d2-lss.yaml) | C+L      | [Link](https://www.dropbox.com/scl/fi/8lgd1hkod2a15mwry0fvd/bevfusion-seg.pth?rlkey=2tmgw7mcrlwy9qoqeui63tay9&dl=1) |
+| Model                                                        | Modality | Inference time | Checkpoint                                                   |
+| ------------------------------------------------------------ | -------- | -------------- | ------------------------------------------------------------ |
+| [BEVFusion](https://github.com/mit-han-lab/bevfusion/blob/main/configs/nuscenes/seg/fusion-bev256d2-lss.yaml) | C+L      | ~101ms         | [Link](https://www.dropbox.com/scl/fi/8lgd1hkod2a15mwry0fvd/bevfusion-seg.pth?rlkey=2tmgw7mcrlwy9qoqeui63tay9&dl=1) |
 
 ## Disclaimer
 

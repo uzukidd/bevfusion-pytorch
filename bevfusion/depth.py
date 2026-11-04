@@ -68,12 +68,14 @@ def project_lidar_depth(
 class DepthLSSTransform(LSSTransform):
     """Detection's depth-conditioned camera lift, with chunked BEV pooling."""
 
-    def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference"):
+    def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference",
+                 precompute=True):
         if pool_backend not in ("reference", "cuda", "auto"):
             raise ValueError(f"Unknown BEV pooling backend: {pool_backend!r}")
         if not isinstance(pool_depth_chunk, int) or pool_depth_chunk <= 0:
             raise ValueError("pool_depth_chunk must be a positive integer")
-        super().__init__(image_size=image_size, pool_depth_chunk=pool_depth_chunk)
+        super().__init__(image_size=image_size, pool_depth_chunk=pool_depth_chunk,
+                         pool_backend=pool_backend, precompute=precompute)
         self.pool_backend = pool_backend
         self.dx = nn.Parameter(torch.tensor([0.3, 0.3, 20.0]), requires_grad=False)
         self.bx = nn.Parameter(torch.tensor([-53.85, -53.85, 0.0]), requires_grad=False)
@@ -112,18 +114,9 @@ class DepthLSSTransform(LSSTransform):
                              f"got {tuple(x.shape)}")
         depth_image = project_lidar_depth(points, camera2lidar, camera_intrinsics,
                                           img_aug_matrix, lidar_aug_matrix, self.image_size)
-        geometry = self.get_geometry(camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix)
-        coords = self._voxel_indices(geometry)
         prediction = self._predict(x, depth_image).reshape(b, n, self.D + self.C, h, w)
         depth = prediction[:, :, :self.D].softmax(2)
         features = prediction[:, :, self.D:]
-        nx, ny, nz = (int(v) for v in self.nx)
-        out = x.new_zeros((b * nz * nx * ny, self.C), dtype=torch.float32)
-        for bi in range(b):
-            for ni in range(n):
-                for start in range(0, self.D, self.pool_depth_chunk):
-                    end = min(self.D, start + self.pool_depth_chunk)
-                    lifted = depth[bi, ni, start:end, :, :, None] * features[bi, ni].permute(1, 2, 0)[None]
-                    self._accumulate(out, coords[bi, ni, start:end], lifted, bi)
-        out = out.reshape(b, nz, nx, ny, self.C).permute(0, 1, 4, 2, 3).reshape(b, nz * self.C, nx, ny)
+        out = self._pool_predictions(depth, features, camera2lidar, camera_intrinsics,
+                                     img_aug_matrix, lidar_aug_matrix)
         return self.downsample(out.contiguous())

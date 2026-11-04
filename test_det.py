@@ -74,17 +74,25 @@ def main(argv=None):
     load_options = dict(device=args.device, backend=args.backend, **calibration)
     if args.config is not None:
         load_options["config"] = args.config
-    model = BEVFusionDet.from_pretrained(args.checkpoint, **load_options)
+    model = BEVFusionDet.from_pretrained(args.checkpoint,camera_batch_size=6, **load_options)
     if getattr(model, "_camera_intrinsics", None) is None or getattr(model, "_camera2lidar", None) is None:
         parser.error("Camera calibration is required. Supply samples/calibration.json, --calibration, "
                      "input tensor calibration, or a complete model with bound calibration.")
     score_threshold = args.score_threshold
     if score_threshold is None:
         score_threshold = model.config["model"]["heads"]["object"]["bbox_coder"]["score_threshold"]
-    started = time.perf_counter()
+
+
+    # Warm up
     with torch.inference_mode():
         predictions = model(sample["images"], sample["points"], score_threshold=score_threshold)
+
+    started = time.perf_counter()
+    for _ in range(10):
+        with torch.inference_mode():
+            predictions = model(sample["images"], sample["points"], score_threshold=score_threshold)
     elapsed = time.perf_counter() - started
+    elapsed = elapsed / 10.0
     classes = tuple(getattr(model, "classes", OBJECT_CLASSES))
     print("classes:", classes)
     print("boxes_3d:", tuple(predictions["boxes_3d"].shape), predictions["boxes_3d"].dtype)

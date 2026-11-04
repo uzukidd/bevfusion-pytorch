@@ -57,6 +57,15 @@ class BEVFusionBase(nn.Module):
         self.set_calibration(camera_intrinsics, camera2lidar, img_aug_matrix)
         self.load_info = {}
 
+    def clear_bev_cache(self):
+        """Release cached camera geometry and pooling associations."""
+        self.encoders["camera"]["vtransform"].clear_bev_cache()
+        return self
+
+    def bev_cache_info(self):
+        """Inspect the bounded runtime plan without returning mutable indices."""
+        return self.encoders["camera"]["vtransform"].bev_cache_info()
+
     def set_calibration(self, camera_intrinsics, camera2lidar, img_aug_matrix=None):
         """Bind original-image intrinsics and camera-to-reference-LiDAR transforms."""
         device = next(self.parameters()).device

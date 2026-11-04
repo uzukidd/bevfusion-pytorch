@@ -217,11 +217,16 @@ class GeneralizedLSSFPN(nn.Module):
 
 
 class LSSTransform(nn.Module):
-    def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference"):
+    def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference",
+                 precompute=True):
         super().__init__()
         if pool_backend not in ("reference", "cuda", "auto"):
             raise ValueError("pool_backend must be reference, cuda or auto")
         self.pool_backend = pool_backend
+        self.precompute_enabled = bool(precompute)
+        self._bev_cache = None
+        self._bev_cache_hits = 0
+        self._bev_cache_misses = 0
         self.image_size = tuple(image_size)
         self.feature_size = tuple(s // 8 for s in image_size)
         self.C, self.D = 80, 118
@@ -240,6 +245,86 @@ class LSSTransform(nn.Module):
             nn.Conv2d(80, 80, 3, stride=2, padding=1, bias=False), nn.BatchNorm2d(80), nn.ReLU(True),
             nn.Conv2d(80, 80, 3, padding=1, bias=False), nn.BatchNorm2d(80), nn.ReLU(True),
         )
+
+    def clear_bev_cache(self):
+        """Release the single cached calibration plan; leave diagnostic counters."""
+        self._bev_cache = None
+
+    def bev_cache_info(self):
+        """Return cache counters and resident index bytes, without exposing tensors."""
+        cache = self._bev_cache
+        return {"enabled": self.precompute_enabled, "entries": int(cache is not None),
+                "hits": self._bev_cache_hits, "misses": self._bev_cache_misses,
+                "chunks": len(cache[3].chunks) if cache is not None else 0,
+                "bytes": (cache[3].nbytes + cache[1].numel() * cache[1].element_size()
+                          + cache[2].numel() * cache[2].element_size()) if cache is not None else 0}
+
+    def _apply(self, fn, recurse=True):
+        # Plans are ordinary runtime attributes, never checkpoint buffers.
+        self.clear_bev_cache()
+        return super()._apply(fn, recurse=recurse)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        # Parent model.load_state_dict recursively invokes this method.
+        self.clear_bev_cache()
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def train(self, mode=True):
+        if mode:
+            self.clear_bev_cache()
+        return super().train(mode)
+
+    def _get_bev_plan(self, camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix):
+        from .pooling import build_pool_plan
+
+        matrices = (camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix)
+        geometry_values = (*matrices, self.dx, self.bx, self.nx)
+        metadata = (tuple((tuple(t.shape), t.device, t.dtype) for t in geometry_values),
+                    tuple(self.frustum.shape), self.frustum.device, self.frustum.dtype,
+                    self.image_size, self.feature_size, self.D, self.C, self.pool_depth_chunk)
+        # Small matrices are compared by value because the public input validator
+        # clones them each frame. Exact comparisons also catch inplace edits to
+        # inference tensors, which do not have a usable tensor version counter.
+        values = torch.cat([t.detach().reshape(-1).double() for t in geometry_values])
+        cache = self._bev_cache
+        if cache is not None and cache[0] == metadata:
+            same = torch.stack(((values == cache[1]).all(),
+                                (self.frustum.detach() == cache[2]).all())).all().item()
+            if same:
+                self._bev_cache_hits += 1
+                return cache[3]
+        # Retain at most one calibration: moving sensors cannot grow an LRU
+        # indefinitely, and a new frame must never use a stale association.
+        self.clear_bev_cache()
+        geometry = self.get_geometry(*matrices)
+        coordinates = self._voxel_indices(geometry)
+        shape = tuple(int(value) for value in self.nx)
+        plan = build_pool_plan(coordinates, shape, self.pool_depth_chunk)
+        self._bev_cache = (metadata, values.detach().clone(), self.frustum.detach().clone(), plan)
+        self._bev_cache_misses += 1
+        return plan
+
+    def _pool_predictions(self, depth, features, camera2lidar, camera_intrinsics,
+                          img_aug_matrix, lidar_aug_matrix):
+        matrices = (camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix)
+        # Bare inference CUDA kernels have no autograd registration; eval alone
+        # is insufficient. Bypass for gradients, training, tracing and ONNX export.
+        if (self.precompute_enabled and not self.training and not torch.is_grad_enabled()
+                and not torch.jit.is_tracing() and not torch.onnx.is_in_onnx_export()):
+            from .pooling import pool_with_plan
+            return pool_with_plan(self._get_bev_plan(*matrices), depth, features, self.pool_backend)
+        geometry = self.get_geometry(*matrices)
+        coords = self._voxel_indices(geometry)
+        b, n, _, _, _ = depth.shape
+        nx, ny, nz = (int(v) for v in self.nx)
+        out = features.new_zeros((b * nz * nx * ny, self.C), dtype=torch.float32)
+        for bi in range(b):
+            for ni in range(n):
+                for start in range(0, self.D, self.pool_depth_chunk):
+                    end = min(self.D, start + self.pool_depth_chunk)
+                    lifted = depth[bi, ni, start:end, :, :, None] * features[bi, ni].permute(1, 2, 0)[None]
+                    self._accumulate(out, coords[bi, ni, start:end], lifted, bi)
+        return out.reshape(b, nz, nx, ny, self.C).permute(0, 1, 4, 2, 3).reshape(b, nz * self.C, nx, ny)
 
     def get_geometry(self, camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix):
         b, n = camera2lidar.shape[:2]
@@ -309,29 +394,21 @@ class LSSTransform(nn.Module):
         b, n, c, h, w = x.shape
         if (h, w) != self.feature_size:
             raise ValueError(f"Expected LSS feature size {self.feature_size}, got {(h, w)}")
-        geometry = self.get_geometry(camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix)
-        coords = self._voxel_indices(geometry)
         prediction = self.depthnet(x.reshape(b * n, c, h, w).float()).reshape(b, n, self.D + self.C, h, w)
         depth = prediction[:, :, :self.D].softmax(2)
         features = prediction[:, :, self.D:]
-        nx, ny, nz = (int(v) for v in self.nx)
-        out = x.new_zeros((b * nz * nx * ny, self.C), dtype=torch.float32)
-        for bi in range(b):
-            for ni in range(n):
-                for start in range(0, self.D, self.pool_depth_chunk):
-                    end = min(self.D, start + self.pool_depth_chunk)
-                    lifted = depth[bi, ni, start:end, :, :, None] * features[bi, ni].permute(1, 2, 0)[None]
-                    self._accumulate(out, coords[bi, ni, start:end], lifted, bi)
-        out = out.reshape(b, nz, nx, ny, self.C).permute(0, 1, 4, 2, 3).reshape(b, nz * self.C, nx, ny)
+        out = self._pool_predictions(depth, features, camera2lidar, camera_intrinsics,
+                                     img_aug_matrix, lidar_aug_matrix)
         return self.downsample(out.contiguous())
 
 
 class NativeCameraEncoder(nn.ModuleDict):
     def __init__(self, camera_batch_size=1, pool_depth_chunk=16, *, vtransform=None,
-                 pool_backend="reference"):
+                 pool_backend="reference", precompute=True):
         super().__init__({"backbone": SwinTransformer(), "neck": GeneralizedLSSFPN(),
                           "vtransform": vtransform if vtransform is not None else LSSTransform(
-                              pool_depth_chunk=pool_depth_chunk, pool_backend=pool_backend)})
+                              pool_depth_chunk=pool_depth_chunk, pool_backend=pool_backend,
+                              precompute=precompute)})
         self.camera_batch_size = camera_batch_size
 
     def encode_images(self, images):

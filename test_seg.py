@@ -76,16 +76,24 @@ def main():
 
     # 1. Load all model modules and optionally bind camera calibration once.
     model = BEVFusionSeg.from_pretrained(args.checkpoint, head_checkpoint=args.head_checkpoint,
-                                        device=args.device, backend=args.backend, **calibration)
+                                        device=args.device, backend=args.backend, 
+                                        camera_batch_size=6, **calibration)
     if model._camera_intrinsics is None or model._camera2lidar is None:
         parser.error("Camera calibration is required. Put calibration.json in --samples, pass --calibration, "
                      "or load a complete model with matching calibration already bound.")
+
+    # Warm up
+    with torch.inference_mode():
+        predictions = model(sample["images"], sample["points"])
+    
     # 2. The actual model invocation needs only the two sensor tensors.
     started = time.perf_counter()
-    with torch.inference_mode():
-        probabilities = model(sample["images"], sample["points"])
+    for _ in range(10):
+        with torch.inference_mode():
+            probabilities = model(sample["images"], sample["points"])
 
     elapsed = time.perf_counter() - started
+    elapsed = elapsed / 10.0
     print("classes:", model.classes)
     print("probabilities:", tuple(probabilities.shape), probabilities.dtype, probabilities.device)
     print("range:", float(probabilities.min()), float(probabilities.max()))
@@ -117,7 +125,7 @@ def main():
             "seg_" + input_name + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".png")
         figure = plot_prediction(sample["images"], sample["points"], probabilities, model.classes,
                                  camera_names=sample.get("camera_names"), threshold=args.threshold,
-                                 save_path=figure_path, show=False)
+                                 save_path=figure_path, show=False,)
         print("saved visualization:", figure_path, flush=True)
         if args.no_show:
             plt.close(figure)
