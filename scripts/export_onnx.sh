@@ -7,4 +7,4 @@ if [[ ! -x "$python_path" || ! -d "$(dirname -- "$(dirname -- "$python_path")")/
     printf 'Set BEVFUSION_PYTHON to an existing non-base Conda interpreter.\n' >&2
     exit 1
 fi
-exec "$python_path" "$script_dir/export_onnx.py" "$@"
+exec "$python_path" "$script_dir/../tools/export_onnx.py" "$@"

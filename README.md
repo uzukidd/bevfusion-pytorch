@@ -9,31 +9,41 @@
 
 ## Usages
 
+### Inference
+
 1. Download the official checkpoint from https://github.com/mit-han-lab/bevfusion/tree/main and save it to `data\checkpoints`.
 
 2. Run the following command to compile and install the operators:
 
     ```bash
-    .\scripts\test_onnx.bat
+    scripts\install_ops.bat or scripts\install_ops.sh
     ```
 
 3. Run the following command to launch the demo:
 
     ```bash
-    .\scripts\test_bevfusion_det.bat --checkpoint data/checkpoints/bevfusion-det.pth --samples data/samples --config config/convfuser.yaml --device cuda --backend auto --no-show 
+    python test_det.py --checkpoint data/checkpoints/bevfusion-det.pth --samples data/samples --config config/convfuser.yaml --device cuda --backend auto --no-show 
     ```
 
 	or
 
     ```bash
-    .\scripts\test_bevfusion_seg.bat --checkpoint data/checkpoints/bevfusion-seg.pth --samples data/samples --device cuda --backend auto --no-show
+    python test_seg.py - --checkpoint data/checkpoints/bevfusion-seg.pth --samples data/samples --device cuda --backend auto --no-show
     ```
 
-See `.\test.py` for more details.
+See `.\test_det.py` and `.\test_seg.py`   for more details.
+
+### ONNX
+
+Run the following command to export the model in `.onnx` format:
+
+```bash
+python .\tools\export_onnx.py --checkpoint data/checkpoints/bevfusion-det.pth
+```
 
 ## Supported checkpoints
 
-### 3D Object Detection (on nuScenes )
+### 3D Object Detection (on nuScenes)
 
 | Model                                                        | Modality | Inference time | Checkpoint                                                   |
 | ------------------------------------------------------------ | -------- | -------------- | ------------------------------------------------------------ |

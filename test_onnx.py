@@ -1,7 +1,7 @@
 """ONNX Runtime version of test.py, with the same input and visualization flow.
 
 中文：读取张量或六张 PNG + BIN，预处理后执行 ONNX，保存预测并用 Matplotlib 展示。
-The ONNX graph must use tools/export_onnx.py's five-input segmentation contract.
+Both segmentation and detection use tools/export_onnx.py's five-input contract.
 """
 import argparse
 from datetime import datetime
@@ -18,6 +18,56 @@ from bevfusion.model import _camera_matrix
 from bevfusion.sample_io import load_calibration, load_samples
 
 INPUT_NAMES = ("images", "points", "camera_intrinsics", "camera2lidar", "img_aug_matrix")
+DETECTION_OUTPUT_NAMES = ("boxes_3d", "scores", "labels")
+BOX_COLUMNS = ("x", "y", "z_bottom", "size_x", "size_y", "size_z", "yaw", "vx", "vy")
+
+
+def _metadata(session):
+    # Real ORT sessions expose metadata; tolerate legacy sessions without it.
+    getter = getattr(session, "get_modelmeta", None)
+    return getter().custom_metadata_map if getter is not None else {}
+
+
+def _check_shape(value, expected):
+    shape = getattr(value, "shape", None)
+    if shape is not None and (len(shape) != len(expected) or any(
+            isinstance(actual, (int, np.integer)) and fixed is not None and actual != fixed
+            for actual, fixed in zip(shape, expected))):
+        raise ValueError(f"ONNX {value.name} must have shape {expected}, got {shape}")
+
+
+def infer_task(session):
+    """Identify exact output contracts, including old segmentation without task metadata."""
+    outputs = session.get_outputs()
+    names = {value.name for value in outputs}
+    if len(outputs) == 1 and names == {"probabilities"}:
+        task = "seg"
+        contract = {"probabilities": ("tensor(float)", (1, None, 200, 200))}
+    elif len(outputs) == 3 and names == set(DETECTION_OUTPUT_NAMES):
+        task = "det"
+        contract = {"boxes_3d": ("tensor(float)", (None, 9)),
+                    "scores": ("tensor(float)", (None,)),
+                    "labels": ("tensor(int64)", (None,))}
+    else:
+        raise ValueError("ONNX outputs must be probabilities (seg) or exactly boxes_3d, scores, labels (det)")
+    declared = _metadata(session).get("task")
+    if declared is not None and declared not in ("seg", "det"):
+        raise ValueError(f"Invalid ONNX task metadata: {declared!r}; expected seg or det")
+    if declared is not None and declared != task:
+        raise ValueError(f"ONNX task metadata {declared!r} disagrees with {task} outputs")
+    for value in outputs:
+        dtype, shape = contract[value.name]
+        if getattr(value, "type", dtype) != dtype:
+            raise ValueError(f"ONNX output {value.name} must have type {dtype}")
+        _check_shape(value, shape)
+    if task == "det":
+        metadata = _metadata(session)
+        if metadata.get("box_origin") != "bottom" or metadata.get("box_format_version") != "2":
+            raise ValueError("Detection ONNX requires box_origin='bottom' and box_format_version='2' metadata")
+        decoded_origin = metadata.get("checkpoint_decoded_z_origin")
+        if decoded_origin is not None and decoded_origin not in ("center", "bottom"):
+            raise ValueError("Invalid checkpoint_decoded_z_origin metadata; expected center or bottom")
+    return task
 
 
 def prepare_feed(sample):
@@ -75,23 +125,32 @@ def create_session(model_path, *, device="cpu", threads=8):
         # Each sparse-search Loop owns a subgraph session. Default per-subgraph
         # CUDA streams retain separate cuDNN/cuBLAS handles and can exhaust GPU
         # resources. Reuse the EP stream/handles across all subgraphs instead.
-        providers = [(provider, {"use_ep_level_unified_stream": "1", "use_tf32": "0"}),
+        # The 180x180 detection fuser can otherwise select a cuDNN tactic
+        # requesting >40 GiB workspace on Blackwell. Use ORT's bounded-workspace
+        # selection instead of exhausting a 16 GiB device during the first Conv.
+        providers = [(provider, {"use_ep_level_unified_stream": "1", "use_tf32": "0",
+                                 "cudnn_conv_use_max_workspace": "0",
+                                 "cudnn_conv_algo_search": "DEFAULT"}),
                      "CPUExecutionProvider"]
     session = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
     if device == "cuda" and "CUDAExecutionProvider" not in session.get_providers():
         raise ValueError("CUDA provider could not initialize; check ONNX Runtime CUDA dependencies")
     inputs = session.get_inputs()
-    if {value.name for value in inputs} != set(INPUT_NAMES) or any(value.type != "tensor(float)" for value in inputs):
+    if (len(inputs) != 5 or {value.name for value in inputs} != set(INPUT_NAMES)
+            or any(value.type != "tensor(float)" for value in inputs)):
         raise ValueError("Expected the FP32 five-input ONNX exported by tools/export_onnx.py")
-    if not any(value.name == "probabilities" for value in session.get_outputs()):
-        raise ValueError("ONNX must expose the probabilities segmentation output")
+    shapes = dict(zip(INPUT_NAMES, ((1, 6, 3, 256, 704), (None, 5), (1, 6, 3, 3),
+                                   (1, 6, 4, 4), (1, 6, 4, 4))))
+    for value in inputs:
+        _check_shape(value, shapes[value.name])
+    infer_task(session)
     return session
 
 
-def output_classes(session, count, override=None):
+def output_classes(session, count=None, override=None):
     classes = override
     if classes is None:
-        encoded = session.get_modelmeta().custom_metadata_map.get("classes")
+        encoded = _metadata(session).get("classes")
         if encoded is not None:
             try:
                 classes = json.loads(encoded)
@@ -101,14 +160,38 @@ def output_classes(session, count, override=None):
             classes = SURFACE_CLASSES if count == 4 else MAP_CLASSES
         else:
             raise ValueError("ONNX has no class names; provide --classes in output channel order")
-    if (not isinstance(classes, (list, tuple)) or len(classes) != count
+    if (not isinstance(classes, (list, tuple)) or not classes
+            or (count is not None and len(classes) != count)
             or any(not isinstance(name, str) or not name for name in classes)
-            or len(set(classes)) != count):
-        raise ValueError("Class names must be unique and match the ONNX output channels")
+            or len(set(classes)) != len(classes)):
+        raise ValueError("Class names must be unique and match the ONNX output channels/classes")
     return tuple(classes)
 
 
-def parse_args():
+def detection_predictions(session, arrays, classes=None, score_threshold=None):
+    """Validate decoded physical-bottom boxes; optionally filter returned scores only."""
+    if infer_task(session) != "det":
+        raise ValueError("Detection predictions require a det ONNX model")
+    if score_threshold is not None and not 0 <= score_threshold <= 1:
+        raise ValueError("--score-threshold must be in [0,1]")
+    classes = output_classes(session, override=classes)
+    boxes, scores, labels = arrays
+    if (boxes.dtype != np.float32 or scores.dtype != np.float32 or labels.dtype != np.int64
+            or boxes.ndim != 2 or boxes.shape[1] != 9
+            or scores.shape != (len(boxes),) or labels.shape != scores.shape):
+        raise ValueError("Detection ONNX outputs must be FP32 boxes_3d [N,9], FP32 scores [N], INT64 labels [N]")
+    if (not np.isfinite(boxes).all() or (boxes[:, 3:6] <= 0).any()
+            or not np.isfinite(scores).all() or ((scores < 0) | (scores > 1)).any()):
+        raise ValueError("Detection boxes must be finite with positive dimensions; scores must be finite in [0,1]")
+    if ((labels < 0) | (labels >= len(classes))).any():
+        raise ValueError("Detection labels must index the ONNX classes")
+    if score_threshold is not None:
+        keep = scores >= score_threshold
+        boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+    return dict(zip(DETECTION_OUTPUT_NAMES, (torch.from_numpy(value) for value in (boxes, scores, labels)))), classes
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", "--checkpoint", dest="model", type=Path,
                         default=Path("outputs/onnx/bevfusion-seg.onnx"), help="Exported .onnx model")
@@ -124,18 +207,25 @@ def parse_args():
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--classes", nargs="+", help="Optional class names in ONNX output channel order")
     parser.add_argument("--save-inputs", type=Path, help="Save the original loaded sensor/calibration dictionary")
-    parser.add_argument("--output", type=Path, help="Save probabilities and classes to a new .pt file")
+    parser.add_argument("--output", type=Path, help="Optionally save predictions and classes to a new .pt file")
     parser.add_argument("--figure", type=Path, help="Save visualization to a new PNG (default timestamped path)")
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Display-only threshold; default: segmentation .5, detection .3")
+    parser.add_argument("--score-threshold", type=float, default=None,
+                        help="Detection-only post-inference score filter; cannot change the exported model threshold")
     parser.add_argument("--no-show", action="store_true", help="Save the figure using Agg without a GUI window")
     parser.add_argument("--no-visualization", action="store_true", help="Do not import Matplotlib")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.inputs and (args.image_files or args.lidar_file):
         parser.error("--image-files and --lidar-file require --samples")
     if not args.model.is_file() or args.model.suffix.lower() != ".onnx":
         parser.error("--model must point to an existing .onnx file")
-    if args.threads < 1 or not 0 <= args.threshold <= 1:
-        parser.error("--threads must be positive and --threshold must be in [0,1]")
+    if args.threads < 1:
+        parser.error("--threads must be positive")
+    for name in ("threshold", "score_threshold"):
+        value = getattr(args, name)
+        if value is not None and not 0 <= value <= 1:
+            parser.error(f"--{name.replace('_', '-')} must be in [0,1]")
     if args.no_visualization and args.figure:
         parser.error("--figure cannot be combined with --no-visualization")
     for path in (args.save_inputs, args.output, args.figure):
@@ -146,8 +236,8 @@ def parse_args():
     return parser, args
 
 
-def main():
-    parser, args = parse_args()
+def main(argv=None):
+    parser, args = parse_args(argv)
     torch.set_num_threads(args.threads)
     try:
         if args.samples:
@@ -172,25 +262,61 @@ def main():
     print("[load] ONNX:", args.model, flush=True)
     try:
         session = create_session(args.model, device=args.device, threads=args.threads)
+        task = infer_task(session)
+        if task == "seg" and args.score_threshold is not None:
+            raise ValueError("--score-threshold is only supported for detection ONNX post-inference filtering")
     except ValueError as exc:
         parser.error(str(exc))
+    print("task:", task)
     print("providers:", session.get_providers(), flush=True)
+    threshold = args.threshold if args.threshold is not None else (0.5 if task == "seg" else 0.3)
+    output_names = ["probabilities"] if task == "seg" else list(DETECTION_OUTPUT_NAMES)
+
+    # Warm up
+    arrays = session.run(output_names, feed)
+
     started = time.perf_counter()
-    array = session.run(["probabilities"], feed)[0]
+    for _ in range(10):
+        arrays = session.run(output_names, feed)
     elapsed = time.perf_counter() - started
-    if (array.ndim != 4 or array.shape[0] != 1 or array.shape[2:] != (200, 200)
-            or not np.isfinite(array).all() or array.min() < 0 or array.max() > 1):
-        raise ValueError("ONNX output must be finite sigmoid probabilities [1,C,200,200]")
+    elapsed = elapsed / 10.0
     try:
-        classes = output_classes(session, array.shape[1], args.classes)
+        if task == "seg":
+            array = arrays[0]
+            if (array.ndim != 4 or array.shape[0] != 1 or array.shape[1] < 1
+                    or array.shape[2:] != (200, 200) or not np.isfinite(array).all()
+                    or array.min() < 0 or array.max() > 1):
+                raise ValueError("ONNX output must be finite sigmoid probabilities [1,C,200,200]")
+            classes = output_classes(session, array.shape[1], args.classes)
+            probabilities = torch.from_numpy(array)
+            payload = {"probabilities": probabilities, "classes": classes,
+                       "axis_order": ["batch", "class", "X", "Y"], "resolution_m": 0.5}
+            print("classes:", classes)
+            print("probabilities:", tuple(probabilities.shape), probabilities.dtype)
+            print("range:", float(array.min()), float(array.max()))
+            print("grid: [batch,class,increasing_X,increasing_Y], 200x200, 0.5 m/cell, XY in [-50,50)")
+        else:
+            predictions, classes = detection_predictions(session, arrays, args.classes, args.score_threshold)
+            metadata = dict(_metadata(session))
+            payload = {**predictions, "task": "det", "classes": classes, "box_columns": BOX_COLUMNS,
+                       "coordinate_frame": "reference_lidar", "box_origin": "bottom", "box_format_version": 2,
+                       "checkpoint_decoded_z_origin": metadata.get("checkpoint_decoded_z_origin"),
+                       "score_threshold": args.score_threshold, "score_threshold_stage": "post_inference",
+                       "onnx_metadata": metadata}
+            print("classes:", classes)
+            print("boxes_3d:", tuple(predictions["boxes_3d"].shape), predictions["boxes_3d"].dtype)
+            print("box count:", len(predictions["scores"]))
+            print("scores:", tuple(predictions["scores"].shape), predictions["scores"].dtype)
+            if len(predictions["scores"]):
+                print("score range:", float(predictions["scores"].min()), float(predictions["scores"].max()))
+            print("labels:", tuple(predictions["labels"].shape), predictions["labels"].dtype)
+            print("boxes: [x, y, z_bottom, size_x, size_y, size_z, yaw, vx, vy] in reference LiDAR frame")
+            print("model score threshold (fixed at export):", metadata.get("score_threshold", "unspecified"))
+            if args.score_threshold is not None:
+                print("post-inference score threshold:", args.score_threshold)
     except ValueError as exc:
         parser.error(str(exc))
-    probabilities = torch.from_numpy(array)
-    print("classes:", classes)
-    print("probabilities:", tuple(probabilities.shape), probabilities.dtype)
-    print("range:", float(array.min()), float(array.max()))
     print(f"ONNX inference: {elapsed:.3f} s")
-    print("grid: [batch,class,increasing_X,increasing_Y], 200x200, 0.5 m/cell, XY in [-50,50)")
     if args.save_inputs:
         args.save_inputs.parent.mkdir(parents=True, exist_ok=True)
         with args.save_inputs.open("xb") as stream:
@@ -198,24 +324,33 @@ def main():
         print("saved input tensors:", args.save_inputs)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
+        payload.update(backend="onnxruntime", model=str(args.model.resolve()),
+                       providers=session.get_providers(), inference_seconds=elapsed)
         with args.output.open("xb") as stream:
-            torch.save({"probabilities": probabilities, "classes": classes,
-                        "axis_order": ["batch", "class", "X", "Y"], "resolution_m": 0.5,
-                        "backend": "onnxruntime", "model": str(args.model.resolve()),
-                        "providers": session.get_providers(), "inference_seconds": elapsed}, stream)
+            torch.save(payload, stream)
         print("saved predictions:", args.output)
     if not args.no_visualization:
         import matplotlib
         if args.no_show:
             matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from bevfusion.visualization import plot_prediction
         figure_path = args.figure or Path("outputs/visualizations") / (
             input_name + "_onnx_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".png")
-        figure = plot_prediction(sample["images"], sample["points"], probabilities, classes,
-                                 camera_names=sample.get("camera_names"), threshold=args.threshold,
-                                 title=f"BEVFusion ONNX | six cameras + LiDAR + {len(classes)}-class segmentation",
-                                 save_path=figure_path, show=False)
+        if task == "seg":
+            from bevfusion.visualization import plot_prediction
+            figure = plot_prediction(sample["images"], sample["points"], probabilities, classes,
+                                     camera_names=sample.get("camera_names"), threshold=threshold,
+                                     title=f"BEVFusion ONNX | six cameras + LiDAR + {len(classes)}-class segmentation",
+                                     save_path=figure_path, show=False)
+        else:
+            from bevfusion.detection_visualization import plot_detection
+            figure = plot_detection(
+                sample["images"], sample["points"], predictions, classes,
+                camera_intrinsics=sample.get("camera_intrinsics"), camera2lidar=sample.get("camera2lidar"),
+                img_aug_matrix=sample.get("img_aug_matrix"), camera_names=sample.get("camera_names"),
+                threshold=threshold, title="BEVFusion ONNX | six cameras + LiDAR + 3D detection",
+                save_path=figure_path, show=False,
+            )
         print("saved visualization:", figure_path, flush=True)
         if args.no_show:
             plt.close(figure)

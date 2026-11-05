@@ -221,6 +221,7 @@ __marimo__/
 
 # Generated BEVFusion artifacts and external resources
 tests/
+references/
 outputs/
 output/
 data/checkpoints

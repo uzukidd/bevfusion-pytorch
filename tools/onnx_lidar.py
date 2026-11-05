@@ -110,7 +110,9 @@ def _sort_keys(values: torch.Tensor):
     return sorted_values[:-1], permutation[:-1]
 
 
-def voxelize(points: torch.Tensor, max_points: int = 10, max_voxels: int = 120000):
+def voxelize(points: torch.Tensor, max_points: int = 10, max_voxels: int = 120000,
+             *, voxel_size=(0.1, 0.1, 0.2),
+             point_cloud_range=(-51.2, -51.2, -5.0, 51.2, 51.2, 3.0)):
     """Mean of the first ten points in each of the first 120000 voxels.
 
     Input is floating point [P,5]; output is float32 [M,5] and int64 XYZ
@@ -120,15 +122,18 @@ def voxelize(points: torch.Tensor, max_points: int = 10, max_voxels: int = 12000
     points = points.float()
     # Keep the traced input path alive at P=0. This point is guaranteed to be
     # rejected by the ordinary coordinate bounds mask before grouping.
-    dummy = points.new_tensor([[1024.0, 1024.0, 1024.0, 0.0, 0.0]])
+    grid_shape = tuple(round((high - low) / size) for low, high, size in zip(
+        point_cloud_range[:3], point_cloud_range[3:], voxel_size))
+    outside = [high + size for high, size in zip(point_cloud_range[3:], voxel_size)]
+    dummy = points.new_tensor([[*outside, 0.0, 0.0]])
     points = torch.cat((points, dummy), dim=0)
-    size = points.new_tensor([0.1, 0.1, 0.2])
-    lower = points.new_tensor([-51.2, -51.2, -5.0])
-    bounds = torch.tensor([1024, 1024, 40], device=points.device, dtype=torch.int64)
+    size = points.new_tensor(voxel_size)
+    lower = points.new_tensor(point_cloud_range[:3])
+    bounds = torch.tensor(grid_shape, device=points.device, dtype=torch.int64)
     coords = torch.floor((points[:, :3] - lower) / size).long()
     keep = ((coords >= 0) & (coords < bounds)).all(dim=1)
     points, coords = points[keep], coords[keep]
-    point_keys = (coords[:, 0] * 1024 + coords[:, 1]) * 41 + coords[:, 2]
+    point_keys = (coords[:, 0] * grid_shape[1] + coords[:, 1]) * (grid_shape[2] + 1) + coords[:, 2]
     unique, inverse = torch.unique(point_keys, sorted=True, return_inverse=True)
     positions = torch.arange(points.shape[0], device=points.device, dtype=torch.int64)
     first = torch.zeros_like(unique) + points.shape[0]
@@ -250,9 +255,10 @@ class OnnxLidarEncoder(nn.Module):
         self.encoder_layers = _adapt_module(original_backbone.encoder_layers)
         self.conv_out = _adapt_module(original_backbone.conv_out)
         self.training = original_backbone.training
+        self.sparse_shape = tuple(original_backbone.sparse_shape)
 
     def forward(self, features: torch.Tensor, coords: torch.Tensor):
-        state = SparseState(features, coords.long(), (1024, 1024, 41))
+        state = SparseState(features, coords.long(), self.sparse_shape)
         state = self.conv_input(state)
         state = self.encoder_layers(state)
         state = self.conv_out(state)
