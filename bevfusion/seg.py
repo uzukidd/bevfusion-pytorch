@@ -33,14 +33,16 @@ class BEVFusionSeg(BEVFusionBase):
 
     def __init__(self, *, camera_intrinsics=None, camera2lidar=None,
                  img_aug_matrix=None, camera_batch_size=1, pool_depth_chunk=16,
-                 classes=MAP_CLASSES, quantize_decoder=False, backend="reference", precompute=True):
+                 classes=MAP_CLASSES, quantize_decoder=False, backend="reference", precompute=True,
+                 pool_backend=None):
         if camera_batch_size < 0 or pool_depth_chunk < 1:
             raise ValueError("camera_batch_size must be >=0 and pool_depth_chunk must be >0")
         classes = tuple(classes)
         if classes not in (tuple(MAP_CLASSES), SURFACE_CLASSES):
             raise ValueError("Supported classes are the original six map classes or four surface classes")
         super().__init__(
-            NativeCameraEncoder(camera_batch_size, pool_depth_chunk, pool_backend=backend,
+            NativeCameraEncoder(camera_batch_size, pool_depth_chunk,
+                                 pool_backend=backend if pool_backend is None else pool_backend,
                                 precompute=precompute),
             ReferenceSparseEncoder(backend=backend), backend=backend,
             camera_intrinsics=camera_intrinsics, camera2lidar=camera2lidar,
@@ -87,6 +89,7 @@ class BEVFusionSeg(BEVFusionBase):
             "camera_batch_size": self.encoders["camera"].camera_batch_size,
             "pool_depth_chunk": self.encoders["camera"]["vtransform"].pool_depth_chunk,
             "backend": self.backend,
+            "pool_backend": self.encoders["camera"]["vtransform"].pool_backend,
             "precompute": getattr(self.encoders["camera"]["vtransform"], "precompute_enabled", True),
         })
 

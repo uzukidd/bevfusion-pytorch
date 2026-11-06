@@ -26,7 +26,7 @@ class BEVFusionDet(BEVFusionBase):
 
     def __init__(self, *, camera_intrinsics=None, camera2lidar=None,
                  img_aug_matrix=None, camera_batch_size=1, pool_depth_chunk=16,
-                 config=None, backend="auto", precompute=True):
+                 config=None, backend="auto", precompute=True, pool_backend=None):
         if camera_batch_size < 0 or pool_depth_chunk < 1:
             raise ValueError("camera_batch_size must be >=0 and pool_depth_chunk must be >0")
         resolved = load_detection_config(config)
@@ -34,7 +34,7 @@ class BEVFusionDet(BEVFusionBase):
         super().__init__(
             NativeCameraEncoder(camera_batch_size, pool_depth_chunk,
                                 vtransform=DepthLSSTransform(pool_depth_chunk=pool_depth_chunk,
-                                                            pool_backend=backend,
+                                                            pool_backend=backend if pool_backend is None else pool_backend,
                                                             precompute=precompute)),
             ReferenceSparseEncoder(lidar_cfg["backbone"]["sparse_shape"], backend=backend),
             backend=backend, voxel_size=resolved["voxel_size"],
@@ -78,6 +78,7 @@ class BEVFusionDet(BEVFusionBase):
             "camera_batch_size": self.encoders["camera"].camera_batch_size,
             "pool_depth_chunk": self.encoders["camera"]["vtransform"].pool_depth_chunk,
             "backend": self.backend,
+            "pool_backend": self.encoders["camera"]["vtransform"].pool_backend,
             "precompute": getattr(self.encoders["camera"]["vtransform"], "precompute_enabled", True),
         })
 

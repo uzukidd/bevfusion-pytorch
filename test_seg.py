@@ -12,7 +12,7 @@ import torch
 from bevfusion import BEVFusionSeg
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True,
                         help="Original six-class checkpoint or packed complete model")
@@ -34,7 +34,9 @@ def main():
     parser.add_argument("--head-checkpoint", type=Path,
                         help="Optional trained four-class head paired with the original base checkpoint")
     parser.add_argument("--backend", choices=("reference", "auto", "cuda"), default="reference",
-                        help="Shared operator backend; auto uses installed packages on CUDA")
+                        help="Voxelization/sparse convolution backend; also the default camera pooling backend")
+    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference"), default=None,
+                        help="Camera BEV pooling only; independent of --backend, default: inherit model settings")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, help="Optional output .pt containing probabilities and class names")
     parser.add_argument("--save-model", type=Path, help="Optional new file: complete model including bound calibration")
@@ -42,7 +44,7 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5, help="Independent segmentation mask display threshold")
     parser.add_argument("--no-show", action="store_true", help="Save the Matplotlib figure without opening a GUI window")
     parser.add_argument("--no-visualization", action="store_true", help="Run inference without importing Matplotlib")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.inputs and (args.calibration or args.image_files or args.lidar_file):
         parser.error("--calibration, --image-files and --lidar-file are options for --samples")
     if not 0 <= args.threshold <= 1:
@@ -75,9 +77,13 @@ def main():
                    if key in sample}
 
     # 1. Load all model modules and optionally bind camera calibration once.
-    model = BEVFusionSeg.from_pretrained(args.checkpoint, head_checkpoint=args.head_checkpoint,
-                                        device=args.device, backend=args.backend, 
-                                        camera_batch_size=6, **calibration)
+    load_options = dict(head_checkpoint=args.head_checkpoint, device=args.device,
+                        backend=args.backend, camera_batch_size=6, **calibration)
+    if args.pool_backend is not None:
+        load_options["pool_backend"] = args.pool_backend
+    model = BEVFusionSeg.from_pretrained(args.checkpoint, **load_options)
+    pool_backend = model.encoders["camera"]["vtransform"].pool_backend
+    print("pool backend:", pool_backend)
     if model._camera_intrinsics is None or model._camera2lidar is None:
         parser.error("Camera calibration is required. Put calibration.json in --samples, pass --calibration, "
                      "or load a complete model with matching calibration already bound.")
@@ -87,11 +93,15 @@ def main():
         predictions = model(sample["images"], sample["points"])
     
     # 2. The actual model invocation needs only the two sensor tensors.
+    if torch.device(args.device).type == "cuda":
+        torch.cuda.synchronize(args.device)
     started = time.perf_counter()
     for _ in range(10):
         with torch.inference_mode():
             probabilities = model(sample["images"], sample["points"])
 
+    if torch.device(args.device).type == "cuda":
+        torch.cuda.synchronize(args.device)
     elapsed = time.perf_counter() - started
     elapsed = elapsed / 10.0
     print("classes:", model.classes)
@@ -108,7 +118,8 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("xb") as stream:
             torch.save({"probabilities": probabilities.cpu(), "classes": model.classes,
-                        "axis_order": ["batch", "class", "X", "Y"], "resolution_m": 0.5}, stream)
+                        "axis_order": ["batch", "class", "X", "Y"], "resolution_m": 0.5,
+                        "pool_backend": pool_backend}, stream)
         print("saved predictions:", args.output)
     if args.save_model:
         args.save_model.parent.mkdir(parents=True, exist_ok=True)

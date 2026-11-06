@@ -17,7 +17,10 @@ def main(argv=None):
     source.add_argument("--samples", type=Path, help="Directory containing six PNG images and one float32 BIN point cloud")
     parser.add_argument("--checkpoint", type=Path, default=Path("data/checkpoints/bevfusion-det.pth"))
     parser.add_argument("--config", type=Path, help="Optional detection YAML, e.g. config/convfuser.yaml")
-    parser.add_argument("--backend", choices=("auto", "reference", "cuda"), default="auto")
+    parser.add_argument("--backend", choices=("auto", "reference", "cuda"), default="auto",
+                        help="Voxelization/sparse convolution backend; also the default camera pooling backend")
+    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference"), default=None,
+                        help="Camera BEV pooling only; independent of --backend, default: inherit model settings")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--calibration", type=Path, help="Original-image calibration JSON/PT; defaults to samples/calibration.json")
     parser.add_argument("--image-files", nargs=6, metavar="PNG", help="Six paths relative to --samples, in camera/calibration order")
@@ -74,7 +77,11 @@ def main(argv=None):
     load_options = dict(device=args.device, backend=args.backend, **calibration)
     if args.config is not None:
         load_options["config"] = args.config
+    if args.pool_backend is not None:
+        load_options["pool_backend"] = args.pool_backend
     model = BEVFusionDet.from_pretrained(args.checkpoint,camera_batch_size=6, **load_options)
+    pool_backend = model.encoders["camera"]["vtransform"].pool_backend
+    print("pool backend:", pool_backend)
     if getattr(model, "_camera_intrinsics", None) is None or getattr(model, "_camera2lidar", None) is None:
         parser.error("Camera calibration is required. Supply samples/calibration.json, --calibration, "
                      "input tensor calibration, or a complete model with bound calibration.")
@@ -87,10 +94,14 @@ def main(argv=None):
     with torch.inference_mode():
         predictions = model(sample["images"], sample["points"], score_threshold=score_threshold)
 
+    if torch.device(args.device).type == "cuda":
+        torch.cuda.synchronize(args.device)
     started = time.perf_counter()
     for _ in range(10):
         with torch.inference_mode():
             predictions = model(sample["images"], sample["points"], score_threshold=score_threshold)
+    if torch.device(args.device).type == "cuda":
+        torch.cuda.synchronize(args.device)
     elapsed = time.perf_counter() - started
     elapsed = elapsed / 10.0
     classes = tuple(getattr(model, "classes", OBJECT_CLASSES))
@@ -109,6 +120,7 @@ def main(argv=None):
         payload = {name: predictions[name].detach().cpu() for name in ("boxes_3d", "scores", "labels")}
         payload.update(classes=classes, box_columns=("x", "y", "z_bottom", "size_x", "size_y", "size_z", "yaw", "vx", "vy"),
                        coordinate_frame="reference_lidar", score_threshold=score_threshold,
+                       pool_backend=pool_backend,
                        box_origin="bottom", box_format_version=2,
                        checkpoint_decoded_z_origin=model.config["model"]["heads"]["object"]["bbox_coder"].get(
                            "decoded_z_origin", "bottom"))

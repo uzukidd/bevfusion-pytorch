@@ -220,8 +220,8 @@ class LSSTransform(nn.Module):
     def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference",
                  precompute=True):
         super().__init__()
-        if pool_backend not in ("reference", "cuda", "auto"):
-            raise ValueError("pool_backend must be reference, cuda or auto")
+        if pool_backend not in ("reference", "cuda", "auto", "compatible"):
+            raise ValueError("pool_backend must be reference, cuda, auto or compatible")
         self.pool_backend = pool_backend
         self.precompute_enabled = bool(precompute)
         self._bev_cache = None
@@ -253,10 +253,17 @@ class LSSTransform(nn.Module):
     def bev_cache_info(self):
         """Return cache counters and resident index bytes, without exposing tensors."""
         cache = self._bev_cache
+        plan = cache[3] if cache is not None else None
+        if plan is not None and hasattr(plan, "statistics"):
+            statistics = plan.statistics()
+            chunks, index_bytes = statistics["groups"], statistics["index_bytes"]
+        else:
+            chunks = len(plan.chunks) if plan is not None else 0
+            index_bytes = plan.nbytes if plan is not None else 0
         return {"enabled": self.precompute_enabled, "entries": int(cache is not None),
                 "hits": self._bev_cache_hits, "misses": self._bev_cache_misses,
-                "chunks": len(cache[3].chunks) if cache is not None else 0,
-                "bytes": (cache[3].nbytes + cache[1].numel() * cache[1].element_size()
+                "chunks": chunks,
+                "bytes": (index_bytes + cache[1].numel() * cache[1].element_size()
                           + cache[2].numel() * cache[2].element_size()) if cache is not None else 0}
 
     def _apply(self, fn, recurse=True):
@@ -281,13 +288,15 @@ class LSSTransform(nn.Module):
         geometry_values = (*matrices, self.dx, self.bx, self.nx)
         metadata = (tuple((tuple(t.shape), t.device, t.dtype) for t in geometry_values),
                     tuple(self.frustum.shape), self.frustum.device, self.frustum.dtype,
-                    self.image_size, self.feature_size, self.D, self.C, self.pool_depth_chunk)
+                    self.image_size, self.feature_size, self.D, self.C, self.pool_depth_chunk,
+                    self.pool_backend)
         # Small matrices are compared by value because the public input validator
         # clones them each frame. Exact comparisons also catch inplace edits to
         # inference tensors, which do not have a usable tensor version counter.
         values = torch.cat([t.detach().reshape(-1).double() for t in geometry_values])
         cache = self._bev_cache
-        if cache is not None and cache[0] == metadata:
+        retain_plan = self.precompute_enabled or self.pool_backend != "compatible"
+        if retain_plan and cache is not None and cache[0] == metadata:
             same = torch.stack(((values == cache[1]).all(),
                                 (self.frustum.detach() == cache[2]).all())).all().item()
             if same:
@@ -299,14 +308,27 @@ class LSSTransform(nn.Module):
         geometry = self.get_geometry(*matrices)
         coordinates = self._voxel_indices(geometry)
         shape = tuple(int(value) for value in self.nx)
-        plan = build_pool_plan(coordinates, shape, self.pool_depth_chunk)
-        self._bev_cache = (metadata, values.detach().clone(), self.frustum.detach().clone(), plan)
+        if self.pool_backend == "compatible":
+            from .compatible_pooling import CompatibleBEVPool
+            # Keep runtime indices inside the ordinary cache tuple, outside the
+            # model module/state_dict tree, exactly like the native pool plan.
+            plan = CompatibleBEVPool(coordinates, shape, self.C).to(device=self.frustum.device)
+        else:
+            plan = build_pool_plan(coordinates, shape, self.pool_depth_chunk)
+        if retain_plan:
+            self._bev_cache = (metadata, values.detach().clone(), self.frustum.detach().clone(), plan)
         self._bev_cache_misses += 1
         return plan
 
     def _pool_predictions(self, depth, features, camera2lidar, camera_intrinsics,
                           img_aug_matrix, lidar_aug_matrix):
         matrices = (camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix)
+        if self.pool_backend == "compatible":
+            if self.training or torch.is_grad_enabled():
+                raise RuntimeError("compatible pooling is inference-only; use eval() and inference_mode()")
+            if torch.jit.is_tracing() or torch.onnx.is_in_onnx_export():
+                raise RuntimeError("Export compatible pooling explicitly with tools/export_bev_pool.py")
+            return self._get_bev_plan(*matrices)(depth, features)
         # Bare inference CUDA kernels have no autograd registration; eval alone
         # is insufficient. Bypass for gradients, training, tracing and ONNX export.
         if (self.precompute_enabled and not self.training and not torch.is_grad_enabled()

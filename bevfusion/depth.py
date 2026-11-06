@@ -70,7 +70,7 @@ class DepthLSSTransform(LSSTransform):
 
     def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference",
                  precompute=True):
-        if pool_backend not in ("reference", "cuda", "auto"):
+        if pool_backend not in ("reference", "cuda", "auto", "compatible"):
             raise ValueError(f"Unknown BEV pooling backend: {pool_backend!r}")
         if not isinstance(pool_depth_chunk, int) or pool_depth_chunk <= 0:
             raise ValueError("pool_depth_chunk must be a positive integer")
