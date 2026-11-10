@@ -16,6 +16,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True,
                         help="Original six-class checkpoint or packed complete model")
+    parser.add_argument("--config", type=Path, help="Operator-only YAML containing operators.bev_pool")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--inputs", type=Path,
                         help="torch.save dict: images, points, and calibration unless bound in model")
@@ -34,9 +35,13 @@ def main(argv=None):
     parser.add_argument("--head-checkpoint", type=Path,
                         help="Optional trained four-class head paired with the original base checkpoint")
     parser.add_argument("--backend", choices=("reference", "auto", "cuda"), default="reference",
-                        help="Voxelization/sparse convolution backend; also the default camera pooling backend")
-    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference"), default=None,
-                        help="Camera BEV pooling only; independent of --backend, default: inherit model settings")
+                        help="Default operator backend; overridden by --lidar-backend or --pool-backend")
+    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference", "horizon", "hat"), default=None,
+                        help="Camera pooling override; horizon requires the WSL horizon_plugin_pytorch wheel")
+    parser.add_argument("--pool-num-points", type=int, default=None,
+                        help="HAT pooling samples per BEV cell, integer in [1,1024]; default: config or 10")
+    parser.add_argument("--lidar-backend", choices=("compatible", "auto", "cuda", "reference"), default=None,
+                        help="LiDAR voxelization/sparse encoder only; compatible uses CPU geometry and tensor computation")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, help="Optional output .pt containing probabilities and class names")
     parser.add_argument("--save-model", type=Path, help="Optional new file: complete model including bound calibration")
@@ -45,6 +50,8 @@ def main(argv=None):
     parser.add_argument("--no-show", action="store_true", help="Save the Matplotlib figure without opening a GUI window")
     parser.add_argument("--no-visualization", action="store_true", help="Run inference without importing Matplotlib")
     args = parser.parse_args(argv)
+    if args.pool_num_points is not None and not 1 <= args.pool_num_points <= 1024:
+        parser.error("--pool-num-points must be in [1,1024]")
     if args.inputs and (args.calibration or args.image_files or args.lidar_file):
         parser.error("--calibration, --image-files and --lidar-file are options for --samples")
     if not 0 <= args.threshold <= 1:
@@ -79,11 +86,21 @@ def main(argv=None):
     # 1. Load all model modules and optionally bind camera calibration once.
     load_options = dict(head_checkpoint=args.head_checkpoint, device=args.device,
                         backend=args.backend, camera_batch_size=6, **calibration)
+    if args.config is not None:
+        load_options["config"] = args.config
     if args.pool_backend is not None:
         load_options["pool_backend"] = args.pool_backend
+    if args.pool_num_points is not None:
+        load_options["pool_num_points"] = args.pool_num_points
+    if args.lidar_backend is not None:
+        load_options["lidar_backend"] = args.lidar_backend
     model = BEVFusionSeg.from_pretrained(args.checkpoint, **load_options)
     pool_backend = model.encoders["camera"]["vtransform"].pool_backend
     print("pool backend:", pool_backend)
+    pool_num_points = getattr(model.encoders["camera"]["vtransform"], "pool_num_points", 10)
+    print("pool num points:", pool_num_points)
+    lidar_backend = getattr(model, "lidar_backend", args.backend)
+    print("lidar backend:", lidar_backend)
     if model._camera_intrinsics is None or model._camera2lidar is None:
         parser.error("Camera calibration is required. Put calibration.json in --samples, pass --calibration, "
                      "or load a complete model with matching calibration already bound.")
@@ -119,7 +136,7 @@ def main(argv=None):
         with args.output.open("xb") as stream:
             torch.save({"probabilities": probabilities.cpu(), "classes": model.classes,
                         "axis_order": ["batch", "class", "X", "Y"], "resolution_m": 0.5,
-                        "pool_backend": pool_backend}, stream)
+                        "pool_backend": pool_backend, "pool_num_points": pool_num_points, "lidar_backend": lidar_backend}, stream)
         print("saved predictions:", args.output)
     if args.save_model:
         args.save_model.parent.mkdir(parents=True, exist_ok=True)

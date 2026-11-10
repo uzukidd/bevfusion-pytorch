@@ -48,6 +48,11 @@ class SearchSorted(torch.autograd.Function):
 
         def any_active(context, lo, hi):
             active = context.op("Cast", context.op("Less", lo, hi), to_i=7)
+            # CUDA ORT cannot ReduceSum a zero-length vector to a scalar with
+            # keepdims=0. Append the additive identity in both the entry and
+            # loop-body condition, so empty query sets still reduce shape [1].
+            identity = context.op("Constant", value_t=torch.tensor([0], dtype=torch.int64))
+            active = context.op("Concat", active, identity, axis_i=0)
             total = context.op("ReduceSum", active, keepdims_i=0)
             return context.op("Greater", total, zero)
 
@@ -233,9 +238,41 @@ class OnnxSparseConv(ReferenceSparseConv):
         return SparseState(result, out_coords, out_shape)
 
 
+class _OnnxSparseBatchNorm(nn.Module):
+    """Inference affine math defined for empty [0,C] sparse states.
+
+    cuDNN BatchNormalization rejects N=0. Running statistics and affine
+    parameters remain shared; dynamic sparse graphs never use batch statistics.
+    """
+    def __init__(self, original: nn.BatchNorm1d):
+        super().__init__()
+        if original.running_mean is None or original.running_var is None:
+            raise ValueError("Sparse ONNX BatchNorm requires tracked running statistics")
+        self.weight = original.weight
+        self.bias = original.bias
+        self.register_buffer("running_mean", original.running_mean)
+        self.register_buffer("running_var", original.running_var)
+        self.register_buffer("num_batches_tracked", original.num_batches_tracked)
+        self.eps = original.eps
+        self.training = original.training
+
+    def forward(self, features):
+        if self.training:
+            raise RuntimeError("Sparse ONNX BatchNorm is inference-only; call eval()")
+        scale = torch.rsqrt(self.running_var + self.eps)
+        if self.weight is not None:
+            scale = scale * self.weight
+        shift = -self.running_mean * scale
+        if self.bias is not None:
+            shift = shift + self.bias
+        return features * scale + shift
+
+
 def _adapt_module(module: nn.Module) -> nn.Module:
     if isinstance(module, ReferenceSparseConv):
         return OnnxSparseConv(module)
+    if isinstance(module, nn.BatchNorm1d):
+        return _OnnxSparseBatchNorm(module)
     adapted = copy.copy(module)
     adapted._modules = OrderedDict((name, _adapt_module(child))
                                    for name, child in module._modules.items())

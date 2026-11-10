@@ -55,6 +55,34 @@ python .\tools\export_onnx.py --checkpoint data/checkpoints/bevfusion-det.pth
 | ------------------------------------------------------------ | -------- | -------------- | ------------------------------------------------------------ |
 | [BEVFusion](https://github.com/mit-han-lab/bevfusion/blob/main/configs/nuscenes/seg/fusion-bev256d2-lss.yaml) | C+L      | ~101ms         | [Link](https://www.dropbox.com/scl/fi/8lgd1hkod2a15mwry0fvd/bevfusion-seg.pth?rlkey=2tmgw7mcrlwy9qoqeui63tay9&dl=1) |
 
+## Supported operators
+
+### BEV pooling
+
+Specify operator implementations by adding the `--pool-backend` option:
+
+| Backend      | Implementation                                               |
+| ------------ | ------------------------------------------------------------ |
+| `reference`  | pytorch reference                                            |
+| `cuda`       | CUDA operators from mmdet3d                                  |
+| `auto`       | select the original CUDA or reference path based on the device |
+| `compatible` | standard ONNX implementation (Gather、Mul、ReduceSum、Add)   |
+| `horizon`    | `BevPoolV2` from `horizon_plugin`                            |
+| `hat`        | HAT style implementaion                                      |
+
+The K for `hat` is set by adding `--pool-num-points` or `operators.bev_pool_num_points` and defaults to **10**.
+
+### LiDAR voxelization & sparse convolution
+
+Specify operator implementations by adding the `--lidar-backend` option:
+
+| Backend      | Implementation                                               |
+| ------------ | ------------------------------------------------------------ |
+| `reference`  | pytorch reference                                            |
+| `cuda`       | `spconv` operators from mmdet3d                              |
+| `auto`       | select the original CUDA or reference path based on the device |
+| `compatible` | standard ONNX implementation (Gather、Mul、ReduceSum、Add)   |
+
 ## Disclaimer
 
 CAUTION: This repository has not been thoroughly tested or validated. Use it with caution and at your own risk. The authors assume no responsibility for any issues, losses, or damages arising from its use.

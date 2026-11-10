@@ -1,7 +1,7 @@
 """ONNX Runtime version of test.py, with the same input and visualization flow.
 
 中文：读取张量或六张 PNG + BIN，预处理后执行 ONNX，保存预测并用 Matplotlib 展示。
-Both segmentation and detection use tools/export_onnx.py's five-input contract.
+Both tasks accept dynamic five-input or explicitly fixed-calibration HAT two-input models.
 """
 import argparse
 from datetime import datetime
@@ -18,6 +18,10 @@ from bevfusion.model import _camera_matrix
 from bevfusion.sample_io import load_calibration, load_samples
 
 INPUT_NAMES = ("images", "points", "camera_intrinsics", "camera2lidar", "img_aug_matrix")
+FIXED_INPUT_NAMES = ("images", "points")
+CALIBRATION_NAMES = INPUT_NAMES[2:]
+INPUT_SHAPES = dict(zip(INPUT_NAMES, ((1, 6, 3, 256, 704), (None, 5),
+                                    (1, 6, 3, 3), (1, 6, 4, 4), (1, 6, 4, 4))))
 DETECTION_OUTPUT_NAMES = ("boxes_3d", "scores", "labels")
 BOX_COLUMNS = ("x", "y", "z_bottom", "size_x", "size_y", "size_z", "yaw", "vx", "vy")
 
@@ -109,6 +113,74 @@ def prepare_feed(sample):
             for name, value in zip(INPUT_NAMES, tensors)}
 
 
+def validate_fixed_calibration(metadata):
+    """Validate bound K/extrinsic/augmentation for a two-input HAT graph.
+
+    Return detached FP32 NumPy matrices. Fixed calibration is checked against
+    every prepared sample before dropping those matrices from the ORT feed.
+    """
+    if metadata.get("calibration_mode") != "fixed" or metadata.get("pool_backend") != "hat":
+        raise ValueError("Two-input ONNX requires calibration_mode='fixed' and pool_backend='hat' metadata")
+    count = metadata.get("pool_num_points")
+    if (not isinstance(count, str) or not count.isascii() or not count.isdecimal()
+            or not 1 <= int(count) <= 1024):
+        raise ValueError("Fixed-calibration HAT ONNX requires pool_num_points metadata in [1,1024]")
+    try:
+        bound = json.loads(metadata["fixed_calibration"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Fixed-calibration ONNX requires valid fixed_calibration JSON metadata") from exc
+    if not isinstance(bound, dict) or set(bound) != set(CALIBRATION_NAMES):
+        raise ValueError("fixed_calibration must contain exactly camera_intrinsics, camera2lidar and img_aug_matrix")
+    matrices = {}
+    for name in CALIBRATION_NAMES:
+        try:
+            matrix = _camera_matrix(bound[name], name, (INPUT_SHAPES[name][-2:],))
+        except (TypeError, ValueError, RuntimeError, OverflowError) as exc:
+            raise ValueError(f"Invalid fixed_calibration {name}: {exc}") from exc
+        # Export metadata uses explicit batch and six-camera dimensions. Do not
+        # silently accept a malformed record through _camera_matrix's shorthand.
+        if matrix is None or np.shape(bound[name]) != INPUT_SHAPES[name]:
+            raise ValueError(f"fixed_calibration {name} must have shape {INPUT_SHAPES[name]}")
+        matrices[name] = np.ascontiguousarray(matrix.numpy(), dtype=np.float32)
+    return matrices
+
+
+def session_input_contract(session):
+    """Accept legacy five-input graphs or metadata-bound two-input HAT graphs."""
+    inputs = session.get_inputs()
+    names = [value.name for value in inputs]
+    if (len(names) != len(set(names)) or any(value.type != "tensor(float)" for value in inputs)
+            or not ((len(names) == 5 and set(names) == set(INPUT_NAMES))
+                    or (len(names) == 2 and set(names) == set(FIXED_INPUT_NAMES)))):
+        raise ValueError("Expected an FP32 five-input ONNX or fixed-calibration HAT two-input ONNX")
+    for value in inputs:
+        _check_shape(value, INPUT_SHAPES[value.name])
+    if len(names) == 2:
+        return validate_fixed_calibration(_metadata(session))
+    if _metadata(session).get("calibration_mode") == "fixed":
+        raise ValueError("Fixed-calibration ONNX must have only images and points inputs")
+    return None
+
+
+def select_session_feed(session, feed):
+    """Match sample calibration before selecting the actual ORT graph inputs."""
+    bound = session_input_contract(session)
+    if not isinstance(feed, dict) or not set(INPUT_NAMES).issubset(feed):
+        raise ValueError("Prepared sensor feed requires images, points and all three calibration matrices")
+    if bound is not None:
+        for name, expected in bound.items():
+            actual = feed[name]
+            try:
+                matrix = _camera_matrix(actual, name, (INPUT_SHAPES[name][-2:],))
+            except (TypeError, ValueError, RuntimeError, OverflowError) as exc:
+                raise ValueError(f"Invalid runtime calibration {name}: {exc}") from exc
+            if (matrix is None or np.shape(actual) != expected.shape
+                    or not np.allclose(matrix.numpy(), expected, atol=1e-6, rtol=1e-6)):
+                raise ValueError(f"Runtime calibration {name} differs from fixed ONNX calibration; "
+                                 "re-export the model for the changed calibration")
+    return {value.name: feed[value.name] for value in session.get_inputs()}
+
+
 def create_session(model_path, *, device="cpu", threads=8):
     if threads < 1:
         raise ValueError("threads must be positive")
@@ -135,14 +207,7 @@ def create_session(model_path, *, device="cpu", threads=8):
     session = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
     if device == "cuda" and "CUDAExecutionProvider" not in session.get_providers():
         raise ValueError("CUDA provider could not initialize; check ONNX Runtime CUDA dependencies")
-    inputs = session.get_inputs()
-    if (len(inputs) != 5 or {value.name for value in inputs} != set(INPUT_NAMES)
-            or any(value.type != "tensor(float)" for value in inputs)):
-        raise ValueError("Expected the FP32 five-input ONNX exported by tools/export_onnx.py")
-    shapes = dict(zip(INPUT_NAMES, ((1, 6, 3, 256, 704), (None, 5), (1, 6, 3, 3),
-                                   (1, 6, 4, 4), (1, 6, 4, 4))))
-    for value in inputs:
-        _check_shape(value, shapes[value.name])
+    session_input_contract(session)
     infer_task(session)
     return session
 
@@ -262,6 +327,7 @@ def main(argv=None):
     print("[load] ONNX:", args.model, flush=True)
     try:
         session = create_session(args.model, device=args.device, threads=args.threads)
+        feed = select_session_feed(session, feed)
         task = infer_task(session)
         if task == "seg" and args.score_threshold is not None:
             raise ValueError("--score-threshold is only supported for detection ONNX post-inference filtering")
@@ -316,6 +382,10 @@ def main(argv=None):
                 print("post-inference score threshold:", args.score_threshold)
     except ValueError as exc:
         parser.error(str(exc))
+    for name in ("calibration_mode", "pool_backend", "pool_num_points"):
+        value = _metadata(session).get(name)
+        if value is not None:
+            payload[name] = int(value) if name == "pool_num_points" and value.isdecimal() else value
     print(f"ONNX inference: {elapsed:.3f} s")
     if args.save_inputs:
         args.save_inputs.parent.mkdir(parents=True, exist_ok=True)

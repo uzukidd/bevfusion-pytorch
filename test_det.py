@@ -18,9 +18,13 @@ def main(argv=None):
     parser.add_argument("--checkpoint", type=Path, default=Path("data/checkpoints/bevfusion-det.pth"))
     parser.add_argument("--config", type=Path, help="Optional detection YAML, e.g. config/convfuser.yaml")
     parser.add_argument("--backend", choices=("auto", "reference", "cuda"), default="auto",
-                        help="Voxelization/sparse convolution backend; also the default camera pooling backend")
-    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference"), default=None,
-                        help="Camera BEV pooling only; independent of --backend, default: inherit model settings")
+                        help="Default operator backend; overridden by --lidar-backend or --pool-backend")
+    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference", "horizon", "hat"), default=None,
+                        help="Camera pooling override; horizon requires the WSL horizon_plugin_pytorch wheel")
+    parser.add_argument("--pool-num-points", type=int, default=None,
+                        help="HAT pooling samples per BEV cell, integer in [1,1024]; default: config or 10")
+    parser.add_argument("--lidar-backend", choices=("compatible", "auto", "cuda", "reference"), default=None,
+                        help="LiDAR voxelization/sparse encoder only; compatible uses CPU geometry and tensor computation")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--calibration", type=Path, help="Original-image calibration JSON/PT; defaults to samples/calibration.json")
     parser.add_argument("--image-files", nargs=6, metavar="PNG", help="Six paths relative to --samples, in camera/calibration order")
@@ -37,6 +41,8 @@ def main(argv=None):
     parser.add_argument("--no-show", action="store_true", help="Save a figure without opening a GUI window")
     parser.add_argument("--no-visualization", action="store_true", help="Skip visualization and Matplotlib imports")
     args = parser.parse_args(argv)
+    if args.pool_num_points is not None and not 1 <= args.pool_num_points <= 1024:
+        parser.error("--pool-num-points must be in [1,1024]")
     if args.inputs and (args.calibration or args.image_files or args.lidar_file):
         parser.error("--calibration, --image-files and --lidar-file are options for --samples")
     for name in ("score_threshold", "threshold"):
@@ -79,9 +85,17 @@ def main(argv=None):
         load_options["config"] = args.config
     if args.pool_backend is not None:
         load_options["pool_backend"] = args.pool_backend
+    if args.pool_num_points is not None:
+        load_options["pool_num_points"] = args.pool_num_points
+    if args.lidar_backend is not None:
+        load_options["lidar_backend"] = args.lidar_backend
     model = BEVFusionDet.from_pretrained(args.checkpoint,camera_batch_size=6, **load_options)
     pool_backend = model.encoders["camera"]["vtransform"].pool_backend
     print("pool backend:", pool_backend)
+    pool_num_points = getattr(model.encoders["camera"]["vtransform"], "pool_num_points", 10)
+    print("pool num points:", pool_num_points)
+    lidar_backend = getattr(model, "lidar_backend", args.backend)
+    print("lidar backend:", lidar_backend)
     if getattr(model, "_camera_intrinsics", None) is None or getattr(model, "_camera2lidar", None) is None:
         parser.error("Camera calibration is required. Supply samples/calibration.json, --calibration, "
                      "input tensor calibration, or a complete model with bound calibration.")
@@ -120,7 +134,7 @@ def main(argv=None):
         payload = {name: predictions[name].detach().cpu() for name in ("boxes_3d", "scores", "labels")}
         payload.update(classes=classes, box_columns=("x", "y", "z_bottom", "size_x", "size_y", "size_z", "yaw", "vx", "vy"),
                        coordinate_frame="reference_lidar", score_threshold=score_threshold,
-                       pool_backend=pool_backend,
+                       pool_backend=pool_backend, pool_num_points=pool_num_points, lidar_backend=lidar_backend,
                        box_origin="bottom", box_format_version=2,
                        checkpoint_decoded_z_origin=model.config["model"]["heads"]["object"]["bbox_coder"].get(
                            "decoded_z_origin", "bottom"))

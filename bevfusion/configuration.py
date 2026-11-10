@@ -10,6 +10,7 @@ DETECTION_CONFIG = {
     "voxel_size": [0.075, 0.075, 0.2],
     "point_cloud_range": [-54., -54., -5., 54., 54., 3.],
     "object_classes": list(OBJECT_CLASSES),
+    "operators": {"bev_pool": None, "bev_pool_num_points": 10},
     "model": {
         "encoders": {
             "camera": {
@@ -44,6 +45,63 @@ DETECTION_CONFIG = {
 }
 
 
+POOL_BACKENDS = ("reference", "auto", "cuda", "compatible", "horizon", "hat")
+
+
+def _pool_backend(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("bev_pool must be reference, auto, cuda, compatible, horizon, hat or BevPoolV2")
+    if value == "BevPoolV2":
+        return "horizon"
+    if value not in POOL_BACKENDS:
+        raise ValueError("bev_pool must be reference, auto, cuda, compatible, horizon, hat or BevPoolV2")
+    return value
+
+
+def load_operator_config(value=None):
+    """Load operator-only settings without importing optional operator packages."""
+    if isinstance(value, (str, Path)):
+        import yaml
+        with Path(value).open(encoding="utf-8") as stream:
+            value = yaml.safe_load(stream)
+    if value is None:
+        return {"operators": {"bev_pool": None}}
+    if not isinstance(value, dict):
+        raise ValueError("Operator config must be a YAML mapping or a dict")
+    if set(value) - {"operators"}:
+        raise ValueError(f"Unsupported operator config fields: {sorted(set(value) - {'operators'}, key=str)}")
+    operators = value.get("operators", {})
+    if not isinstance(operators, dict):
+        raise ValueError("operators must be a mapping")
+    allowed = {"bev_pool", "bev_pool_num_points"}
+    if set(operators) - allowed:
+        raise ValueError(f"Unsupported operator fields: {sorted(set(operators) - allowed, key=str)}")
+    result = {"bev_pool": _pool_backend(operators.get("bev_pool"))}
+    if "bev_pool_num_points" in operators:
+        result["bev_pool_num_points"] = validate_pool_num_points(operators["bev_pool_num_points"])
+    return {"operators": result}
+
+
+def validate_pool_num_points(value):
+    """Validate the fixed HAT sampling capacity; bool is not an integer setting."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1024:
+        raise ValueError("pool_num_points must be an integer in [1,1024]")
+    return value
+
+
+def resolve_pool_num_points(explicit, configured=10):
+    return validate_pool_num_points(configured if explicit is None else explicit)
+
+
+def resolve_pool_backend(explicit, configured, backend):
+    """Explicit selection wins over operator config, then shared backend."""
+    explicit, configured = _pool_backend(explicit), _pool_backend(configured)
+    return _pool_backend(backend) if explicit is None and configured is None else (
+        configured if explicit is None else explicit)
+
+
 def load_detection_config(value=None):
     """Merge a convfuser leaf or resolved dict into the checkpoint's known bases.
 
@@ -59,6 +117,8 @@ def load_detection_config(value=None):
         raise ValueError("Detection config must be a YAML mapping or a dict")
     result = deepcopy(DETECTION_CONFIG)
     adjustable = {
+        "operators.bev_pool",
+        "operators.bev_pool_num_points",
         "model.heads.object.num_proposals",
         "model.heads.object.bbox_coder.score_threshold",
         "model.heads.object.bbox_coder.post_center_range",
@@ -81,6 +141,7 @@ def load_detection_config(value=None):
                 target[key] = deepcopy(comparable)
 
     merge(result, value or {})
+    result["operators"] = load_operator_config({"operators": result["operators"]})["operators"]
     head = result["model"]["heads"]["object"]
     if not isinstance(head["num_proposals"], int) or not 1 <= head["num_proposals"] <= 10 * 180 * 180:
         raise ValueError("num_proposals must be a positive integer within the BEV heatmap size")

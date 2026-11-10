@@ -44,9 +44,14 @@ def parse_args(argv=None):
                         help="Default: outputs/onnx_export/bevfusion-{task}-bevpool_<timestamp>.onnx")
     parser.add_argument("--dtype", choices=("float32", "float16"), default="float32",
                         help="Input depth/features dtype; multiplication, accumulation and output remain FP32")
+    parser.add_argument("--pool-backend", choices=("compatible", "hat"), default="compatible",
+                        help="Exact compatible pooling or fixed-slot HAT-style GridSample adaptation")
+    parser.add_argument("--num-points", type=int, default=10,
+                        help="HAT-style contributions per cell, 1..1024; ignored by compatible pooling")
     parser.add_argument("--max-pairs-per-chunk", type=int, default=16384)
     parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--verify", action="store_true", help="Compare CPU ORT with source and compatible pooling")
+    parser.add_argument("--verify", action="store_true",
+                        help="Verify CPU ORT semantics; HAT-style full-pooling differences are measured, not asserted equal")
     args = parser.parse_args(argv)
     if any(value < 1 for value in args.image_size):
         parser.error("--image-size H W must contain positive integers")
@@ -54,10 +59,16 @@ def parse_args(argv=None):
         parser.error("--image-size is too small for preprocess_images resize=0.48")
     if args.max_pairs_per_chunk < 1 or args.max_pairs_per_chunk > 65535 or args.threads < 1:
         parser.error("--max-pairs-per-chunk must be in [1,65535] and --threads must be positive")
+    if args.pool_backend == "hat":
+        if not 1 <= args.num_points <= 1024:
+            parser.error("--num-points must be in [1,1024] for --pool-backend hat")
+        if args.dtype != "float32":
+            parser.error("--pool-backend hat requires --dtype float32; float16 is not silently cast")
     args.image_size = tuple(args.image_size)
     if args.output is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        args.output = ROOT / "outputs/onnx_export" / f"bevfusion-{args.task}-bevpool_{timestamp}.onnx"
+        suffix = f"-hat-lss-k{args.num_points}" if args.pool_backend == "hat" else ""
+        args.output = ROOT / "outputs/onnx_export" / f"bevfusion-{args.task}-bevpool{suffix}_{timestamp}.onnx"
     args.output = args.output.expanduser()
     args.report_path = args.output.with_suffix(".verification.json")
     if args.output.suffix.lower() != ".onnx":
@@ -155,7 +166,8 @@ def inspect_graph(model):
     inferred = onnx.shape_inference.infer_shapes(model)
     counts = {}
     validation = {"gather_count": 0, "gather_source_axes_checked": 0, "gather_source_axes_unverified": 0,
-                  "max_gather_source_axis": 0, "concat_count": 0, "max_concat_inputs": 0,
+                  "max_gather_source_axis": 0, "grid_sample_count": 0, "grid_sample_shapes_checked": 0,
+                  "grid_sample_shapes_unverified": 0, "concat_count": 0, "max_concat_inputs": 0,
                   "reduce_sum_count": 0, "reduce_sum_axes_checked": 0, "reduce_sum_axes_unverified": 0,
                   "max_reduce_sum_axis": 0, "tensor_shapes_checked": 0, "max_tensor_dimension": 0,
                   "known_dimensions_checked": 0, "unknown_dimensions": 0, "unknown_rank_tensors": 0}
@@ -210,6 +222,18 @@ def inspect_graph(model):
                         validation["gather_source_axes_unverified"] += 1
                 else:
                     validation["gather_source_axes_unverified"] += 1
+            if node.op_type == "GridSample":
+                validation["grid_sample_count"] += 1
+                source, grid = shapes.get(node.input[0]), shapes.get(node.input[1])
+                if source is None or grid is None or any(value is None for value in (*source, *grid)):
+                    validation["grid_sample_shapes_unverified"] += 1
+                else:
+                    if len(source) != 4 or len(grid) != 4 or grid[-1] != 2 or source[0] != grid[0]:
+                        raise ValueError(f"GridSample requires static 4D input and [N,H,W,2] grid: {node.name}")
+                    for height, width in ((source[2], source[3]), (grid[1], grid[2])):
+                        if not 1 <= height <= 1024 or not 1 <= width <= 1024 or height * width > 720 * 1024:
+                            raise ValueError(f"GridSample spatial dimensions exceed candidate limits: {node.name} ({height},{width})")
+                    validation["grid_sample_shapes_checked"] += 1
             if node.op_type == "Concat":
                 count = len(node.input)
                 if count > 1024:
@@ -270,6 +294,7 @@ def inspect_graph(model):
     validation["all_gather_source_axes_verified"] = validation["gather_source_axes_unverified"] == 0
     validation["all_reduce_sum_axes_verified"] = validation["reduce_sum_axes_unverified"] == 0
     return {"operator_counts": counts, "gather_count": validation["gather_count"],
+            "grid_sample_count": validation["grid_sample_count"],
             "all_gather_indices_int32": True, "standard_onnx_operators_only": True,
             "forbidden_operators_absent": True, "shape_validation": validation}
 
@@ -284,6 +309,43 @@ def random_inputs(module, dtype, seed, *, zero=False):
     return depth, features
 
 
+def selected_pool_numpy(coordinates, grid_shape, depth, features, num_points):
+    """Independent first-K oracle from input coordinates, never module grids.
+
+    Walk valid contributions in original B,N,D,H,W order and retain each cell's
+    first K entries. NumPy add.at then accumulates depth-weighted features.
+    """
+    import numpy as np
+    xyz = coordinates.detach().cpu().numpy().reshape(-1, 3)
+    depth = np.asarray(depth, dtype=np.float32)
+    features = np.asarray(features, dtype=np.float32)
+    batch, cameras, bins, height, width = depth.shape
+    channels = features.shape[2]
+    nx, ny, nz = (int(value) for value in grid_shape)
+    counts, selected_depth, selected_feature, selected_cells = {}, [], [], []
+    per_camera, per_batch = bins * height * width, cameras * bins * height * width
+    for rank, (x, y, z) in enumerate(xyz):
+        if not (0 <= x < nx and 0 <= y < ny and 0 <= z < nz):
+            continue
+        bi, within_batch = divmod(rank, per_batch)
+        ni, within_camera = divmod(within_batch, per_camera)
+        pixel = within_camera % (height * width)
+        cell = int(((bi * nz + z) * nx + x) * ny + y)
+        count = counts.get(cell, 0)
+        counts[cell] = count + 1
+        if count < num_points:
+            selected_depth.append(rank)
+            selected_feature.append((bi * cameras + ni) * height * width + pixel)
+            selected_cells.append(cell)
+    dense = np.zeros((batch * nz * nx * ny, channels), dtype=np.float32)
+    if selected_depth:
+        feature_rows = features.transpose(0, 1, 3, 4, 2).reshape(-1, channels)
+        values = depth.reshape(-1)[selected_depth, None] * feature_rows[selected_feature]
+        np.add.at(dense, selected_cells, values)
+    return dense.reshape(batch, nz, nx, ny, channels).transpose(0, 1, 4, 2, 3).reshape(
+        batch, nz * channels, nx, ny)
+
+
 def verify_model(path, module, coordinates, grid_shape, dtype, threads):
     import numpy as np
     import onnxruntime as ort
@@ -292,28 +354,48 @@ def verify_model(path, module, coordinates, grid_shape, dtype, threads):
     options.inter_op_num_threads = 1
     session = ort.InferenceSession(str(path), sess_options=options, providers=["CPUExecutionProvider"])
     plan = build_pool_plan(coordinates, grid_shape, 16)
+    statistics = module.statistics()
+    is_hat = statistics.get("backend") == "hat"
     cases = []
     with torch.inference_mode():
         for index in range(3):
             name = f"random_{index + 1}" if index < 2 else "all_zero"
             depth, features = random_inputs(module, dtype, 20261105 + index, zero=index == 2)
             expected = pool_with_plan(plan, depth.float(), features.float(), "reference").numpy()
-            compatible = module(depth, features).numpy()
+            actual_module = module(depth, features).numpy()
             output = session.run(OUTPUT_NAMES, dict(zip(INPUT_NAMES, (depth.numpy(), features.numpy()))))[0]
             if output.dtype != np.float32 or tuple(output.shape) != tuple(module.output_shape):
                 raise AssertionError("ORT pooling output must be FP32 with the fixed pre-downsample shape")
             result = {"name": name}
-            for key, value in (("module_vs_source", compatible), ("ort_vs_source", output)):
+            parity = []
+            for key, value in (("module_vs_source", actual_module), ("ort_vs_source", output)):
                 if not np.isfinite(value).all():
                     raise AssertionError(f"{name} {key} contains non-finite values")
                 delta = np.abs(value - expected)
-                result[key] = {"max_abs": float(delta.max()), "mean_abs": float(delta.mean())}
-                np.testing.assert_allclose(value, expected, atol=3e-4, rtol=3e-4)
-            result["ort_vs_module_max_abs"] = float(np.abs(output - compatible).max())
-            np.testing.assert_allclose(output, compatible, atol=3e-4, rtol=3e-4)
+                close = bool(np.allclose(value, expected, atol=3e-4, rtol=3e-4))
+                result[key] = {"max_abs": float(delta.max()), "mean_abs": float(delta.mean()),
+                               "passed": close}
+                parity.append(close)
+                if not is_hat:
+                    np.testing.assert_allclose(value, expected, atol=3e-4, rtol=3e-4)
+            result["sourceparity_passed"] = all(parity)
+            result["ort_vs_module_max_abs"] = float(np.abs(output - actual_module).max())
+            np.testing.assert_allclose(output, actual_module, atol=3e-4, rtol=3e-4)
+            if is_hat:
+                selected = selected_pool_numpy(coordinates, grid_shape, depth.numpy(), features.numpy(),
+                                               int(statistics["num_points"]))
+                for key, value in (("module_vs_selected_oracle", actual_module),
+                                   ("ort_vs_selected_oracle", output)):
+                    delta = np.abs(value - selected)
+                    result[key] = {"max_abs": float(delta.max()), "mean_abs": float(delta.mean())}
+                    np.testing.assert_allclose(value, selected, atol=3e-4, rtol=3e-4)
+                result["selected_semantics_passed"] = True
             cases.append(result)
             print("[verify]", json.dumps(result), flush=True)
     return {"runtime_verified": True, "runtime": ort.__version__, "providers": session.get_providers(),
+            "runtime_verification_scope": "ORT/module/independent first-K NumPy oracle" if is_hat else "full-source parity",
+            "sourceparity_passed": all(case["sourceparity_passed"] for case in cases),
+            "selected_semantics_verified": is_hat,
             "tolerances": {"atol": 3e-4, "rtol": 3e-4}, "verification_cases": cases}
 
 
@@ -334,9 +416,15 @@ def main(argv=None):
             calibration["camera2lidar"], calibration["camera_intrinsics"],
             calibration["img_aug_matrix"], calibration["lidar_aug_matrix"]))
         grid_shape = tuple(int(value) for value in transform.nx)
-        module = CompatibleBEVPool.from_transform(transform, calibration["camera2lidar"],
-            calibration["camera_intrinsics"], calibration["img_aug_matrix"],
-            calibration["lidar_aug_matrix"], max_pairs_per_chunk=args.max_pairs_per_chunk).eval()
+        if args.pool_backend == "hat":
+            from bevfusion.hat_pooling import HATLSSPool
+            module = HATLSSPool.from_transform(transform, calibration["camera2lidar"],
+                calibration["camera_intrinsics"], calibration["img_aug_matrix"],
+                calibration["lidar_aug_matrix"], num_points=args.num_points).eval()
+        else:
+            module = CompatibleBEVPool.from_transform(transform, calibration["camera2lidar"],
+                calibration["camera_intrinsics"], calibration["img_aug_matrix"],
+                calibration["lidar_aug_matrix"], max_pairs_per_chunk=args.max_pairs_per_chunk).eval()
     dtype = getattr(torch, args.dtype)
     contract = {"depth": {"shape": list(module.depth_shape), "dtype": args.dtype,
                            "meaning": "Per-camera depth probabilities; softmax along axis 2"},
@@ -358,6 +446,17 @@ def main(argv=None):
                                "feature_size": list(transform.feature_size), "channels": transform.C,
                                "depth_bins": transform.D, "stage": "before_downsample"},
               "statistics": module.statistics(), "opset": 18, "torch": torch.__version__, "onnx": onnx.__version__}
+    report.update(pool_backend=args.pool_backend, backend=args.pool_backend, sourceparity_passed=None,
+                  quantization_verified=False, board_verified=False)
+    if args.pool_backend == "hat":
+        report["sampling"] = {
+            "num_points": args.num_points, "selection_policy": "first_depth_rank",
+            "approximate": bool(report["statistics"]["dropped_points"]),
+            "official_class": False, "official_exact_sort_key": False,
+            "interpolation": report["statistics"].get("interpolation"),
+            "align_corners": report["statistics"].get("align_corners"),
+            "implementation": "official pattern adaptation; sampling order/interpolation are local implementation choices",
+            "normalization": "none", "full_source_equivalence_claimed": False}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
         print(f"[export] {args.task} pooling -> {args.output}", flush=True)
@@ -374,7 +473,9 @@ def main(argv=None):
                     "calibration": json.dumps(calibration_record), "calibration_source": json.dumps(source),
                     "geometry_sha256": json.dumps(geometry_hashes), "grid_profile": json.dumps(report["grid_profile"]),
                     "statistics": json.dumps(report["statistics"]), "input_dtype": args.dtype,
-                    "accumulation_dtype": "float32", "output_dtype": "float32"}
+                    "accumulation_dtype": "float32", "output_dtype": "float32",
+                    "pool_backend": args.pool_backend, "backend": args.pool_backend, "quantization_verified": "false",
+                    "sampling": json.dumps(report.get("sampling"))}
         onnx.helper.set_model_props(graph, metadata)
         onnx.checker.check_model(graph, full_check=True)
         onnx.save(graph, str(args.output))

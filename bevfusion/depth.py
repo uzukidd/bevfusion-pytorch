@@ -69,13 +69,13 @@ class DepthLSSTransform(LSSTransform):
     """Detection's depth-conditioned camera lift, with chunked BEV pooling."""
 
     def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference",
-                 precompute=True):
-        if pool_backend not in ("reference", "cuda", "auto", "compatible"):
+                 precompute=True, pool_num_points=10):
+        if pool_backend not in ("reference", "cuda", "auto", "compatible", "horizon", "hat"):
             raise ValueError(f"Unknown BEV pooling backend: {pool_backend!r}")
         if not isinstance(pool_depth_chunk, int) or pool_depth_chunk <= 0:
             raise ValueError("pool_depth_chunk must be a positive integer")
         super().__init__(image_size=image_size, pool_depth_chunk=pool_depth_chunk,
-                         pool_backend=pool_backend, precompute=precompute)
+                         pool_backend=pool_backend, precompute=precompute, pool_num_points=pool_num_points)
         self.pool_backend = pool_backend
         self.dx = nn.Parameter(torch.tensor([0.3, 0.3, 20.0]), requires_grad=False)
         self.bx = nn.Parameter(torch.tensor([-53.85, -53.85, 0.0]), requires_grad=False)

@@ -37,11 +37,14 @@ class BEVFusionBase(nn.Module):
                  voxel_size=(0.1, 0.1, 0.2),
                  point_cloud_range=(-51.2, -51.2, -5., 51.2, 51.2, 3.),
                  max_voxels=120000, camera_intrinsics=None, camera2lidar=None,
-                 img_aug_matrix=None):
+                 img_aug_matrix=None, lidar_backend=None):
         super().__init__()
         if backend not in ("reference", "auto", "cuda"):
             raise ValueError("backend must be reference, cuda or auto")
         self.backend = backend
+        self.lidar_backend = backend if lidar_backend is None else lidar_backend
+        if self.lidar_backend not in ("reference", "auto", "cuda", "compatible"):
+            raise ValueError("lidar_backend must be reference, auto, cuda or compatible")
         self.voxel_size = tuple(voxel_size)
         self.point_cloud_range = tuple(point_cloud_range)
         self.max_voxels = max_voxels
@@ -124,10 +127,14 @@ class BEVFusionBase(nn.Module):
         """Return [1,512,X,Y] features: seg 128x128, det 180x180."""
         images, points, intrinsic, extrinsic, augmentation = self._prepare_inputs(
             images, points, camera_intrinsics, camera2lidar, img_aug_matrix)
-        features, coords = voxelize(
-            points, max_voxels=self.max_voxels, voxel_size=self.voxel_size,
-            point_cloud_range=self.point_cloud_range, backend=self.backend)
-        lidar_bev = self.encoders["lidar"]["backbone"](features, coords, verbose=False)
+        if self.lidar_backend == "compatible":
+            from .compatible_lidar import compatible_lidar_forward
+            lidar_bev = compatible_lidar_forward(self, points)
+        else:
+            features, coords = voxelize(
+                points, max_voxels=self.max_voxels, voxel_size=self.voxel_size,
+                point_cloud_range=self.point_cloud_range, backend=self.lidar_backend)
+            lidar_bev = self.encoders["lidar"]["backbone"](features, coords, verbose=False)
         camera_bev = self._camera_features(images, points, intrinsic, extrinsic, augmentation)
         if camera_bev.shape[-2:] != lidar_bev.shape[-2:]:
             raise RuntimeError(f"Camera/LiDAR BEV shapes differ: {camera_bev.shape} / {lidar_bev.shape}")

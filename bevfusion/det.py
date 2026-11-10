@@ -6,7 +6,7 @@ from torch import nn
 
 from .base import BEVFusionBase
 from .camera import NativeCameraEncoder
-from .configuration import load_detection_config
+from .configuration import load_detection_config, resolve_pool_backend, resolve_pool_num_points
 from .depth import DepthLSSTransform
 from .detection_head import OBJECT_CLASSES, TransFusionHead
 from .lidar import ReferenceSparseEncoder
@@ -26,18 +26,27 @@ class BEVFusionDet(BEVFusionBase):
 
     def __init__(self, *, camera_intrinsics=None, camera2lidar=None,
                  img_aug_matrix=None, camera_batch_size=1, pool_depth_chunk=16,
-                 config=None, backend="auto", precompute=True, pool_backend=None):
+                 config=None, backend="auto", precompute=True, pool_backend=None,
+                 lidar_backend=None, pool_num_points=None):
         if camera_batch_size < 0 or pool_depth_chunk < 1:
             raise ValueError("camera_batch_size must be >=0 and pool_depth_chunk must be >0")
+        resolved_lidar_backend = backend if lidar_backend is None else lidar_backend
+        if resolved_lidar_backend not in ("reference", "auto", "cuda", "compatible"):
+            raise ValueError("lidar_backend must be reference, auto, cuda or compatible")
         resolved = load_detection_config(config)
+        resolved_pool_backend = resolve_pool_backend(pool_backend, resolved["operators"]["bev_pool"], backend)
+        resolved_pool_num_points = resolve_pool_num_points(
+            pool_num_points, resolved["operators"].get("bev_pool_num_points", 10))
+        pool_options = {} if resolved_pool_num_points == 10 else {"pool_num_points": resolved_pool_num_points}
         lidar_cfg = resolved["model"]["encoders"]["lidar"]
         super().__init__(
             NativeCameraEncoder(camera_batch_size, pool_depth_chunk,
                                 vtransform=DepthLSSTransform(pool_depth_chunk=pool_depth_chunk,
-                                                            pool_backend=backend if pool_backend is None else pool_backend,
-                                                            precompute=precompute)),
-            ReferenceSparseEncoder(lidar_cfg["backbone"]["sparse_shape"], backend=backend),
-            backend=backend, voxel_size=resolved["voxel_size"],
+                                                            pool_backend=resolved_pool_backend,
+                                                            precompute=precompute, **pool_options)),
+            ReferenceSparseEncoder(lidar_cfg["backbone"]["sparse_shape"],
+                                    backend="reference" if resolved_lidar_backend == "compatible" else resolved_lidar_backend),
+            backend=backend, lidar_backend=resolved_lidar_backend, voxel_size=resolved["voxel_size"],
             point_cloud_range=resolved["point_cloud_range"],
             max_voxels=lidar_cfg["voxelize"]["max_voxels"][1],
             camera_intrinsics=camera_intrinsics, camera2lidar=camera2lidar,
@@ -70,6 +79,12 @@ class BEVFusionDet(BEVFusionBase):
 
     @classmethod
     def from_pretrained(cls, checkpoint, *, device="cpu", **kwargs):
+        if "config" in kwargs and "pool_num_points" not in kwargs:
+            kwargs["pool_num_points"] = None
+        if "config" in kwargs and "pool_backend" not in kwargs:
+            # A new operator config overrides the packed model's saved actual
+            # selection; an explicit pool_backend still takes highest priority.
+            kwargs["pool_backend"] = None
         return cls._load_pretrained(checkpoint, FORMAT, device, kwargs)
 
     def save_pretrained(self, path):
@@ -78,7 +93,9 @@ class BEVFusionDet(BEVFusionBase):
             "camera_batch_size": self.encoders["camera"].camera_batch_size,
             "pool_depth_chunk": self.encoders["camera"]["vtransform"].pool_depth_chunk,
             "backend": self.backend,
+            "lidar_backend": self.lidar_backend,
             "pool_backend": self.encoders["camera"]["vtransform"].pool_backend,
+            "pool_num_points": getattr(self.encoders["camera"]["vtransform"], "pool_num_points", 10),
             "precompute": getattr(self.encoders["camera"]["vtransform"], "precompute_enabled", True),
         })
 
