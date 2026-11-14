@@ -7,6 +7,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+if __name__ == "__main__":
+    from tools.horizon_runtime import ensure_plugin_loader
+    ensure_plugin_loader()
+
 import torch
 
 from bevfusion import BEVFusionSeg
@@ -36,12 +40,12 @@ def main(argv=None):
                         help="Optional trained four-class head paired with the original base checkpoint")
     parser.add_argument("--backend", choices=("reference", "auto", "cuda"), default="reference",
                         help="Default operator backend; overridden by --lidar-backend or --pool-backend")
-    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference", "horizon", "hat"), default=None,
-                        help="Camera pooling override; horizon requires the WSL horizon_plugin_pytorch wheel")
+    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference", "horizon", "hat", "hat_plugin"), default=None,
+                        help="Camera pooling override; horizon/hat_plugin require horizon_plugin_pytorch; hat_plugin uses native sampling")
     parser.add_argument("--pool-num-points", type=int, default=None,
-                        help="HAT pooling samples per BEV cell, integer in [1,1024]; default: config or 10")
-    parser.add_argument("--lidar-backend", choices=("compatible", "auto", "cuda", "reference"), default=None,
-                        help="LiDAR voxelization/sparse encoder only; compatible uses CPU geometry and tensor computation")
+                        help="HAT/hat_plugin pooling samples per BEV cell, integer in [1,1024]; default: config or 10")
+    parser.add_argument("--lidar-backend", choices=("compatible", "auto", "cuda", "reference", "hybrid"), default=None,
+                        help="LiDAR backend; hybrid retains SubMConv and uses tiled Conv3D for ordinary sparse convs")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, help="Optional output .pt containing probabilities and class names")
     parser.add_argument("--save-model", type=Path, help="Optional new file: complete model including bound calibration")

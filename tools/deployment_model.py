@@ -14,11 +14,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from bevfusion.compatible_pooling import CompatibleBEVPool
-from bevfusion.compatible_sparse import CompatibleSparseEncoder
-from bevfusion.compatible_voxel import CompatibleVoxelMean
-from bevfusion.hat_pooling import HATLSSPool
-from bevfusion.lidar import ReferenceSparseConv
+from bevfusion.operators.pooling.compatible import CompatibleBEVPool
+from bevfusion.operators.sparse_conv.compatible import CompatibleSparseEncoder
+from bevfusion.operators.voxelization.compatible import CompatibleVoxelMean
+from bevfusion.operators.pooling.hat import HATLSSPool
+from bevfusion.operators.sparse_conv.reference import ReferenceSparseConv
 from tools.onnx_model import OnnxTransFusionHead, _fixed_calibration, atan2
 
 

@@ -13,12 +13,12 @@ import time
 import torch
 
 from .base import _camera_matrix
-from .compatible_sparse import CompatibleSparseEncoder
-from .compatible_voxel import CompatibleVoxelMean, VoxelizationPlan, build_voxel_plan
+from .operators.sparse_conv.compatible import CompatibleSparseEncoder
+from .operators.voxelization.compatible import CompatibleVoxelMean, VoxelizationPlan, build_voxel_plan
 from .depth import project_lidar_depth
-from .lidar import ReferenceSparseConv
+from .operators.sparse_conv.reference import ReferenceSparseConv
 from .preprocessing import prepare_points, preprocess_images, voxelize
-from .sparse_plan import EncoderPlan, plan_sparse_encoder
+from .operators.sparse_conv.plan import EncoderPlan, plan_sparse_encoder
 
 
 @dataclass(frozen=True)

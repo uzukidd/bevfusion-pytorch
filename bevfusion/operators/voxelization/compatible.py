@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .preprocessing import prepare_points
+from .reference import prepare_points
 
 
 def _positive_integer(value, name):

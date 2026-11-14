@@ -1,5 +1,7 @@
-"""Export BEVFusion det/seg to standard ONNX with dynamic point counts.
+"""Export BEVFusion det/seg to standard ONNX with selectable LiDAR graphs.
 
+Compatible LiDAR (default) takes fixed-capacity tensors plus CPU plans rebuilt
+for each frame; --lidar-backend standard_dynamic keeps graph-internal planning.
 Images are normalized FP32 [1,6,3,256,704]; PNG decoding and preprocessing stay
 outside the graph. Without --output, writes outputs/onnx_export/<checkpoint-stem>_<timestamp>.onnx.
 Detection exports decoded bottom-centred boxes/scores/labels; segmentation exports
@@ -50,8 +52,14 @@ def parse_args(argv=None):
     parser.add_argument("--task", choices=("auto", "seg", "det"), default="auto",
                         help="Auto detects the task from checkpoint weights")
     parser.add_argument("--config", type=Path, help="Detection architecture/operator config or segmentation operator config")
-    parser.add_argument("--pool-backend", choices=("reference", "hat"), default=None,
-                        help="Standard dynamic reference pooling or fixed-calibration full-model HAT export")
+    parser.add_argument("--lidar-backend", choices=("compatible", "standard_dynamic", "reference", "auto", "cuda"),
+                        default="compatible", help="LiDAR ONNX graph: compatible uses per-frame CPU plans (default); reference/auto/cuda select the legacy standard_dynamic graph, not custom CUDA kernels")
+    parser.add_argument("--point-capacity", type=int, default=65535)
+    parser.add_argument("--voxel-capacity", type=int, default=32768)
+    parser.add_argument("--sparse-capacity", type=int, default=32768)
+    parser.add_argument("--page-size", type=int, default=32768)
+    parser.add_argument("--pool-backend", choices=("reference", "hat", "compatible"), default=None,
+                        help="Reference pooling is precomputed with --samples/--inputs, otherwise dynamic with a warning; HAT requires fixed calibration")
     parser.add_argument("--pool-num-points", type=int, default=None, help="HAT contributions per cell, 1..1024")
     parser.add_argument("--head-checkpoint", type=Path, help="Optional historical four-class segmentation head")
     parser.add_argument("--score-threshold", type=float,
@@ -63,6 +71,10 @@ def parse_args(argv=None):
     source.add_argument("--samples", type=Path, help="Six PNG cameras, LiDAR BIN and calibration directory")
     parser.add_argument("--calibration", type=Path, help="Optional calibration JSON for --samples")
     parser.add_argument("--verify-device", choices=("cpu", "cuda"), default="cpu", help="ONNX Runtime verification device")
+    parser.add_argument("--cuda-conv-algo", choices=("DEFAULT", "HEURISTIC", "EXHAUSTIVE"), default="DEFAULT",
+                        help="ORT verification cuDNN algorithm selection; DEFAULT preserves current behavior")
+    parser.add_argument("--cuda-mem-limit-mb", type=int,
+                        help="ORT verification GPU allocator limit in MiB; not a hard cuDNN workspace or total GPU memory cap")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="PyTorch export device")
     parser.add_argument("--verify", action="store_true", help="Compare selected ONNX Runtime provider with PyTorch on dynamic inputs")
     parser.add_argument("--verify-only", action="store_true", help="Verify an existing ONNX without overwriting it")
@@ -70,6 +82,21 @@ def parse_args(argv=None):
     parser.add_argument("--rtol", type=float, default=1e-3)
     parser.add_argument("--threads", type=int, default=8)
     args = parser.parse_args(argv)
+    if args.cuda_mem_limit_mb is not None and args.cuda_mem_limit_mb < 1:
+        parser.error("--cuda-mem-limit-mb must be a positive integer")
+    args.requested_lidar_backend = args.lidar_backend
+    if args.lidar_backend in ("reference", "auto", "cuda"):
+        args.lidar_backend = "standard_dynamic"
+    from bevfusion.deployment_inputs import DeploymentProfile
+    try:
+        args.lidar_profile = DeploymentProfile(args.point_capacity, args.voxel_capacity,
+                                               args.sparse_capacity, args.page_size)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.pool_backend == "compatible" and args.lidar_backend != "compatible":
+        parser.error("--pool-backend compatible currently requires --lidar-backend compatible")
+    if args.pool_backend == "compatible" and args.samples is None and args.inputs is None:
+        parser.error("Compatible pooling requires real --samples or --inputs to bind calibration")
     if args.pool_num_points is not None and not 1 <= args.pool_num_points <= 1024:
         parser.error("--pool-num-points must be in [1,1024]")
     if args.calibration is not None and args.samples is None:
@@ -298,13 +325,15 @@ def resolve_export_pool(args, payload):
         count = packed.get("pool_num_points", operators.get("bev_pool_num_points", 10))
     backend = args.pool_backend if args.pool_backend is not None else backend
     backend = "reference" if backend in (None, "reference", "auto", "cuda") else backend
-    if backend not in ("reference", "hat"):
-        raise ValueError(f"Full-model ONNX export does not support pooling backend {backend!r}; select reference or hat explicitly")
+    if backend not in ("reference", "hat", "compatible"):
+        raise ValueError(f"Full-model ONNX export does not support pooling backend {backend!r}; select reference, hat or compatible explicitly")
+    if backend == "compatible" and getattr(args, "lidar_backend", "standard_dynamic") != "compatible":
+        raise ValueError("Compatible pooling requires --lidar-backend compatible")
     count = args.pool_num_points if args.pool_num_points is not None else count
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 1024:
         raise ValueError("HAT pool_num_points must be an integer in [1,1024]")
-    if backend == "hat" and args.inputs is None and args.samples is None:
-        raise ValueError("HAT full-model export requires real --samples or --inputs to bind calibration")
+    if backend in ("hat", "compatible") and args.inputs is None and args.samples is None:
+        raise ValueError(f"{backend} full-model export requires real --samples or --inputs to bind calibration")
     return backend, count
 
 
@@ -319,10 +348,11 @@ def calibration_record(values):
     return {name: value.detach().cpu().tolist() for name, value in zip(INPUT_NAMES[2:], values[2:])}
 
 
-def validate_export_input_contract(graph, backend, num_points, values, *, verify_only=False):
+def validate_export_input_contract(graph, backend, num_points, values, *, verify_only=False, fixed_calibration=None):
     """Verify existing graphs before evaluating them against a requested model."""
     import numpy as np
-    names = INPUT_NAMES[:2] if backend == "hat" else INPUT_NAMES
+    fixed = backend == "hat" if fixed_calibration is None else fixed_calibration
+    names = INPUT_NAMES[:2] if fixed else INPUT_NAMES
     if [value.name for value in graph.graph.input] != names:
         raise ValueError("Existing ONNX input names do not match the requested calibration/pooling mode")
     if not verify_only:
@@ -330,12 +360,14 @@ def validate_export_input_contract(graph, backend, num_points, values, *, verify
     metadata = {item.key: item.value for item in graph.metadata_props}
     if metadata.get("pool_backend", "reference") != backend:
         raise ValueError("Existing ONNX pool_backend differs from requested options")
-    expected_mode = "fixed" if backend == "hat" else "dynamic"
+    expected_mode = "fixed" if fixed else "dynamic"
     if metadata.get("calibration_mode", "dynamic") != expected_mode:
         raise ValueError("Existing ONNX calibration_mode differs from requested options")
-    if backend == "hat":
-        if metadata.get("pool_num_points") != str(num_points):
-            raise ValueError("Existing ONNX pool_num_points differs from requested options")
+    if backend == "hat" and metadata.get("pool_num_points") != str(num_points):
+        raise ValueError("Existing ONNX pool_num_points differs from requested options")
+    if fixed:
+        if backend == "reference" and metadata.get("pooling_precomputed") != "true":
+            raise ValueError("Fixed reference ONNX requires pooling_precomputed='true' metadata")
         try:
             existing = json.loads(metadata["fixed_calibration"])
             for name, matrix in calibration_record(values).items():
@@ -390,9 +422,18 @@ def main(argv=None):
         sample = load_export_sample(args)
     except (ValueError, OSError, KeyError, TypeError) as exc:
         parser.error(str(exc))
+    fixed_calibration = pool_backend == "hat" or sample is not None
+    if not fixed_calibration:
+        warnings.warn("Reference pooling has no --samples or --inputs calibration: exporting dynamic "
+                      "pooling geometry without precomputation. Supply --samples or --inputs to bind "
+                      "a precomputed pooling mapping.", UserWarning, stacklevel=2)
+    if args.requested_lidar_backend == "cuda":
+        warnings.warn("ONNX export does not embed custom CUDA LiDAR kernels; --lidar-backend cuda "
+                      "selects the legacy standard_dynamic ONNX graph. Use compatible for per-frame CPU planning.",
+                      UserWarning, stacklevel=2)
     options = {"backend": "reference", "pool_backend": pool_backend,
                "lidar_backend": "reference", "pool_num_points": num_points,
-               "precompute": pool_backend == "hat", "camera_batch_size": 0}
+               "precompute": fixed_calibration, "camera_batch_size": 0}
     if args.config is not None:
         options["config"] = args.config
     if task == "seg":
@@ -406,20 +447,25 @@ def main(argv=None):
     if task == "det" and threshold is None:
         threshold = model.config["model"]["heads"]["object"]["bbox_coder"]["score_threshold"]
     values = example_inputs(model, sample, args.device)
-    if pool_backend == "hat":
+    if fixed_calibration:
         if not isinstance(sample, dict) or sample.get("camera_intrinsics") is None or sample.get("camera2lidar") is None:
-            parser.error("HAT --inputs/--samples must explicitly provide six-camera intrinsics and extrinsics")
+            parser.error("Fixed pooling --inputs/--samples must explicitly provide six-camera intrinsics and extrinsics")
         if sample["images"].dtype != torch.uint8 and sample.get("img_aug_matrix") is None:
-            parser.error("Normalized HAT input images require explicit img_aug_matrix")
+            parser.error("Normalized fixed-calibration input images require explicit img_aug_matrix")
         if any(tuple(value.shape[:2]) != (1, 6) or not torch.isfinite(value).all() for value in values[2:]):
-            parser.error("HAT calibration must contain finite [1,6,...] camera matrices")
+            parser.error("Fixed pooling calibration must contain finite [1,6,...] camera matrices")
+    if args.lidar_backend == "compatible":
+        from tools.export_compatible_onnx import export_compatible_onnx
+        return export_compatible_onnx(args, model, sample, values, task, pool_backend, num_points,
+                                      threshold, fixed_calibration, parser=parser, started=started)
+    if fixed_calibration:
         from tools.onnx_model import FixedCalibrationOnnxBEVFusion
         wrapper = FixedCalibrationOnnxBEVFusion(model, calibration=values[2:],
-                    score_threshold=threshold, pool_num_points=num_points).eval()
+                    score_threshold=threshold, pool_num_points=num_points, pool_backend=pool_backend).eval()
     else:
         wrapper = OnnxBEVFusion(model, score_threshold=threshold).eval()
-    input_names = INPUT_NAMES[:2] if pool_backend == "hat" else INPUT_NAMES
-    wrapper_values = values[:2] if pool_backend == "hat" else values
+    input_names = INPUT_NAMES[:2] if fixed_calibration else INPUT_NAMES
+    wrapper_values = values[:2] if fixed_calibration else values
     dynamic_axes = {"points": {0: "num_points"}}
     if task == "det":
         dynamic_axes.update({name: {0: "num_boxes"} for name in OUTPUT_NAMES[task]})
@@ -431,14 +477,15 @@ def main(argv=None):
               "input_contract": "normalized FP32 RGB; raw [P,5] XYZ/intensity/time_lag_seconds; per-frame K/extrinsics/augmentation"}
 
     report.update(pool_backend=pool_backend, pool_num_points=num_points,
-                  calibration_mode="fixed" if pool_backend == "hat" else "dynamic",
+                  calibration_mode="fixed" if fixed_calibration else "dynamic",
+                   pooling_precomputed=fixed_calibration,
                   scope="entire_model", lidar_backend="standard_dynamic", bpu_compatible=False)
-    if pool_backend == "hat":
+    if fixed_calibration:
         report.update(fixed_calibration=calibration_record(values), sampling=wrapper.camera.pool.statistics(),
                       input_contract="normalized FP32 RGB; raw [P,5] XYZ/intensity/time_lag_seconds; fixed sensor calibration embedded in graph")
     if args.verify_only:
         existing_graph = onnx.load(str(args.output))
-        validate_export_input_contract(existing_graph, pool_backend, num_points, values, verify_only=True)
+        validate_export_input_contract(existing_graph, pool_backend, num_points, values, verify_only=True, fixed_calibration=fixed_calibration)
         del existing_graph
 
     def reference(inputs):
@@ -452,7 +499,7 @@ def main(argv=None):
         report["adapter_comparison"] = compare_outputs(actual, expected, task, 3e-4, 3e-4)
         if not args.verify_only:
             trace = example_inputs(model, None, args.device)
-            trace = trace[:2] if pool_backend == "hat" else trace
+            trace = trace[:2] if fixed_calibration else trace
             args.output.parent.mkdir(parents=True, exist_ok=True)
             print("[export]", task, "->", args.output, flush=True)
             with warnings.catch_warnings():
@@ -470,9 +517,9 @@ def main(argv=None):
                 "points": "dynamic float32 [P,5], XYZ/intensity/time_lag_seconds",
                 "calibration": "original-image K, camera2lidar, image augmentation"}
     metadata.update(pool_backend=pool_backend, pool_num_points=str(num_points),
-                    calibration_mode=report["calibration_mode"], scope="entire_model",
+                    calibration_mode=report["calibration_mode"], pooling_precomputed=str(fixed_calibration).lower(), scope="entire_model",
                     lidar_backend="standard_dynamic", bpu_compatible="false")
-    if pool_backend == "hat":
+    if fixed_calibration:
         metadata.update(fixed_calibration=json.dumps(report["fixed_calibration"]),
                         sampling=json.dumps(report["sampling"]),
                         calibration="fixed original-image K, camera2lidar, image augmentation",
@@ -495,7 +542,7 @@ def main(argv=None):
                 "box_origin", "box_format_version", "checkpoint_decoded_z_origin", "score_threshold")):
             raise ValueError("Existing ONNX box convention/threshold differs from the checkpoint options")
     validate_graph_contract(graph, task, model.classes)
-    validate_export_input_contract(graph, pool_backend, num_points, values, verify_only=args.verify_only)
+    validate_export_input_contract(graph, pool_backend, num_points, values, verify_only=args.verify_only, fixed_calibration=fixed_calibration)
     report["operator_counts"] = operator_counts(graph.graph)
     report.update(status="exported", file_bytes=args.output.stat().st_size,
                   node_count=len(graph.graph.node), initializer_count=len(graph.graph.initializer),
@@ -503,14 +550,14 @@ def main(argv=None):
     del graph
     if args.verify:
         print("[verify] loading ONNX Runtime", args.verify_device, "session", flush=True)
-        from test_onnx import create_session, select_session_feed
-        session = create_session(args.output, device=args.verify_device, threads=args.threads)
+        from test_onnx import create_session, select_session_feed, cuda_session_kwargs
+        session = create_session(args.output, device=args.verify_device, threads=args.threads, **cuda_session_kwargs(args))
         cases = []
         report["tolerances"] = {"atol": args.atol, "rtol": args.rtol}
         inputs_cases = [("provided" if sample else "synthetic", values)]
-        if sample is not None and pool_backend != "hat":
+        if sample is not None and not fixed_calibration:
             inputs_cases.append(("synthetic_calibration", example_inputs(model, None, args.device)))
-        if pool_backend == "hat":
+        if fixed_calibration:
             inputs_cases.append(("changed_images", (values[0] * .9 + .03, *values[1:])))
         inputs_cases.extend([
             ("empty_points", (values[0], values[1][:0], *values[2:])),

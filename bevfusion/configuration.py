@@ -45,18 +45,18 @@ DETECTION_CONFIG = {
 }
 
 
-POOL_BACKENDS = ("reference", "auto", "cuda", "compatible", "horizon", "hat")
+POOL_BACKENDS = ("reference", "auto", "cuda", "compatible", "horizon", "hat", "hat_plugin")
 
 
 def _pool_backend(value):
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValueError("bev_pool must be reference, auto, cuda, compatible, horizon, hat or BevPoolV2")
+        raise ValueError("bev_pool must be reference, auto, cuda, compatible, horizon, hat, hat_plugin or BevPoolV2")
     if value == "BevPoolV2":
         return "horizon"
     if value not in POOL_BACKENDS:
-        raise ValueError("bev_pool must be reference, auto, cuda, compatible, horizon, hat or BevPoolV2")
+        raise ValueError("bev_pool must be reference, auto, cuda, compatible, horizon, hat, hat_plugin or BevPoolV2")
     return value
 
 

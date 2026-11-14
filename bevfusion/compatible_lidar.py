@@ -11,9 +11,9 @@ import time
 
 import torch
 
-from .compatible_sparse import CompatibleSparseEncoder
-from .compatible_voxel import CompatibleVoxelMean, build_voxel_plan
-from .sparse_plan import plan_sparse_encoder
+from .operators.sparse_conv.compatible import CompatibleSparseEncoder
+from .operators.voxelization.compatible import CompatibleVoxelMean, build_voxel_plan
+from .operators.sparse_conv.plan import plan_sparse_encoder
 
 
 def compatible_lidar_forward(model, points):

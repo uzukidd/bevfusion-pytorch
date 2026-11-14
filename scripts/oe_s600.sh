@@ -1,27 +1,22 @@
 #!/usr/bin/env bash
+# Run toolchain commands in the selected Conda environment without Docker.
 set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "$script_dir/.." && pwd)"
-image="${OE_S600_IMAGE:-registry.d-robotics.cc/deliver/ai_toolchain_ubuntu_22_s100_s600_cpu:v3.7.0}"
-if ! command -v docker >/dev/null 2>&1; then
-    printf 'Docker is unavailable. Run this script in Linux/WSL with Docker configured.\n' >&2
+python_path="${BEVFUSION_HBM_PYTHON:-${BEVFUSION_WSL_PYTHON:-/home/administrator/miniconda3/envs/bevfusion-pytorch/bin/python}}"
+if [[ ! -x "$python_path" || ! -d "$(dirname -- "$(dirname -- "$python_path")")/conda-meta" ]]; then
+    printf 'Set BEVFUSION_HBM_PYTHON to the bevfusion-pytorch Conda interpreter.\n' >&2
     exit 1
 fi
-if ! docker info >/dev/null; then
-    printf 'Docker is inaccessible. Start its service and check Docker socket permissions.\n' >&2
+if [[ -n "${OE_S600_IMAGE:-}" ]]; then
+    printf 'OE_S600_IMAGE is no longer supported; commands run in bevfusion-pytorch.\n' >&2
     exit 1
 fi
-if ! docker image inspect "$image" >/dev/null 2>&1; then
-    printf 'OE image is not installed: %s\nObtain the matching image using the official S600 toolchain instructions.\n' "$image" >&2
-    exit 1
-fi
-terminal_flags=()
-if [[ -t 0 && -t 1 ]]; then
-    terminal_flags=(-it)
-fi
+compiler_bin="$(dirname -- "$python_path")"
 if [[ $# -eq 0 ]]; then
-    set -- bash
+    set -- bash --noprofile --norc
 fi
-exec docker run --rm "${terminal_flags[@]}" \
-    --mount "type=bind,source=$project_dir,target=/workspace" \
-    --workdir /workspace "$image" "$@"
+loader_tunables="${GLIBC_TUNABLES:+$GLIBC_TUNABLES:}glibc.rtld.execstack=2"
+cd -- "$project_dir"
+exec env "PATH=$compiler_bin:$PATH" "CONDA_PREFIX=$(dirname -- "$compiler_bin")" \
+    "GLIBC_TUNABLES=$loader_tunables" "$@"

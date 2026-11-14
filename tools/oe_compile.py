@@ -1,8 +1,8 @@
-"""Bounded OE Docker compilation for project-owned ONNX and calibration files.
+"""Bounded ONNX compilation in the selected bevfusion-pytorch Conda environment.
 
-Windows invokes the existing WSL Docker daemon; Linux invokes Docker directly.
-No image is pulled and no shell interprets command arguments. Dry runs write a
-reviewable YAML/manifest without starting WSL, Docker, or a compiler.
+Windows invokes WSL; Linux invokes the same compiler environment directly.
+No Docker, root account, shell command interpolation, or environment activation is
+used. Dry runs write reviewable configuration without launching a compiler.
 """
 from __future__ import annotations
 
@@ -12,13 +12,16 @@ import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import platform
+import shlex
 import subprocess
 import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+# Kept only for import compatibility; images are no longer accepted by this API.
 DEFAULT_IMAGE = "registry.d-robotics.cc/deliver/ai_toolchain_ubuntu_22_s100_s600_cpu:v3.7.0"
 DEFAULT_WSL_DISTRO = "Ubuntu-26.04"
+DEFAULT_WSL_PYTHON = "/home/administrator/miniconda3/envs/bevfusion-pytorch/bin/python"
 
 
 def _positive_integer(value, name):
@@ -27,19 +30,44 @@ def _positive_integer(value, name):
     return value
 
 
-def _runtime(image, wsl_distro):
-    image = image or os.environ.get("OE_S600_IMAGE") or DEFAULT_IMAGE
-    if not isinstance(image, str) or not image.strip() or image.startswith("-"):
-        raise ValueError("image must name an existing Docker image")
-    windows = platform.system() == "Windows"
+def _runtime(image, wsl_distro, python_path=None):
+    if image is not None:
+        raise ValueError("--oe-image is no longer supported; HBM compilation uses the bevfusion-pytorch Conda environment")
+    system = platform.system()
+    if system not in ("Windows", "Linux"):
+        raise ValueError("HBM compilation requires WSL on Windows or native Linux")
+    windows = system == "Windows"
     if windows and (not isinstance(wsl_distro, str) or not wsl_distro.strip()):
         raise ValueError("wsl_distro must name an existing WSL distribution")
-    prefix = (["wsl.exe", "--distribution", wsl_distro, "--user", "root", "--exec"]
-              if windows else [])
-    return image, windows, prefix
+    python_path = (python_path or os.environ.get("BEVFUSION_HBM_PYTHON")
+                   or os.environ.get("BEVFUSION_WSL_PYTHON") or DEFAULT_WSL_PYTHON)
+    if (not isinstance(python_path, str) or not python_path.startswith("/")
+            or any(char in python_path for char in ("\n", "\r", "\0"))):
+        raise ValueError("python_path must be an absolute Linux Conda Python path")
+    prefix = ["wsl.exe", "--distribution", wsl_distro, "--exec"] if windows else []
+    binary = PurePosixPath(python_path).parent
+    env = ["env", f"PATH={binary}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "GLIBC_TUNABLES=glibc.rtld.execstack=2"]
+    return python_path, windows, prefix, env
+
+
+def _format_command(command):
+    """Render argv for the host shell; execution still uses argv, never a shell."""
+    if platform.system() == "Windows":
+        # PowerShell single-quoted arguments preserve spaces, $, &, and quotes.
+        return "& " + " ".join("'" + str(part).replace("'", "''") + "'" for part in command)
+    return shlex.join(str(part) for part in command)
+
+
+def _print_command(command, *, dry_run=False):
+    rendered = _format_command(command)
+    label = "[dry-run command; not executed]" if dry_run else "[command]"
+    print(f"{label} {rendered}", flush=True)
+    return rendered
 
 
 def _probe(command, timeout_seconds):
+    _print_command(command)
     try:
         process = subprocess.run(command, capture_output=True, text=True,
                                  encoding="utf-8", errors="replace", timeout=timeout_seconds,
@@ -51,23 +79,35 @@ def _probe(command, timeout_seconds):
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
-def detect(*, image=None, wsl_distro=DEFAULT_WSL_DISTRO, timeout_seconds=30):
-    """Check the selected daemon and already-installed image without pulling it."""
+_DETECT_CODE = """import importlib.metadata as m, json, pathlib, shutil, sys
+import horizon_tc_ui, hmct, hbdk4.compiler
+command = shutil.which('hb_compile')
+expected = pathlib.Path(sys.executable).parent / 'hb_compile'
+if command is None or pathlib.Path(command).resolve() != expected.resolve():
+    raise RuntimeError('hb_compile is missing from the selected Conda bin directory')
+print(json.dumps({'python':sys.executable, 'prefix':sys.prefix, 'hb_compile':command,
+    'versions':{name:m.version(name) for name in ('horizon-tc-ui','hbdk4-compiler')}}))
+"""
+
+
+def detect(*, image=None, wsl_distro=DEFAULT_WSL_DISTRO, timeout_seconds=30, python_path=None):
+    """Import the compiler stack and verify its entry point in the selected Conda bin."""
     _positive_integer(timeout_seconds, "timeout_seconds")
-    image, windows, prefix = _runtime(image, wsl_distro)
-    info = _probe(prefix + ["docker", "info", "--format", "{{.ServerVersion}}"], timeout_seconds)
-    result = {"available": False, "image": image, "platform": "windows-wsl" if windows else "linux",
-              "wsl_distro": wsl_distro if windows else None, "checks": [info]}
-    if info["returncode"] != 0:
-        result["reason"] = "Docker is unavailable or its daemon is inaccessible"
+    python_path, windows, prefix, env = _runtime(image, wsl_distro, python_path)
+    check = _probe(prefix + env + [python_path, "-c", _DETECT_CODE], timeout_seconds)
+    result = {"available": False, "backend": "wsl-conda" if windows else "linux-conda",
+              "runtime_python": python_path, "wsl_distro": wsl_distro if windows else None, "checks": [check]}
+    if check["returncode"] != 0:
+        result["reason"] = "Selected Conda environment cannot load horizon-tc-ui, HMCT, HBDK or its hb_compile entry point"
         return result
-    installed = _probe(prefix + ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-                       timeout_seconds)
-    result["checks"].append(installed)
-    if installed["returncode"] != 0:
-        result["reason"] = "The selected OE image is not installed; no implicit pull was attempted"
+    try:
+        details = json.loads(check["stdout"].splitlines()[-1])
+        if not isinstance(details, dict) or not details.get("hb_compile"):
+            raise ValueError("Missing hb_compile path")
+    except (ValueError, IndexError) as exc:
+        result["reason"] = f"Invalid compiler environment probe response: {exc}"
         return result
-    result.update(available=True, docker_version=info["stdout"], image_id=installed["stdout"])
+    result.update(available=True, **details)
     return result
 
 
@@ -81,7 +121,7 @@ def _owned_path(value, name, project_root=None):
         relative = path.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"{name} must resolve inside the project root: {root}") from exc
-    return path, PurePosixPath("/workspace", *relative.parts).as_posix()
+    return path, PurePosixPath(*relative.parts).as_posix()
 
 
 def _input_contract(inputs):
@@ -106,7 +146,7 @@ def _input_contract(inputs):
     return result
 
 
-def _mount_source(root, windows, prefix, dry_run):
+def _runtime_root(root, windows, prefix, dry_run):
     if not windows:
         return root.as_posix(), False
     if dry_run:
@@ -153,19 +193,72 @@ def _artifacts(build_dir):
     return result
 
 
+# A small Linux supervisor owns a single process group. The token lives in the
+# child's environment and a private pid record; cancellation never searches by
+# compiler name and cannot terminate an unrelated user's compiler invocation.
+_RUNNER_CODE = """import json, os, pathlib, signal, subprocess, sys
+pid_path, token, *command = sys.argv[1:]
+env = dict(os.environ, BEVFUSION_COMPILE_ID=token)
+process = subprocess.Popen(command, env=env, start_new_session=True)
+record = pathlib.Path(pid_path)
+try:
+    with record.open('x', encoding='utf-8') as stream:
+        json.dump({'token':token, 'pid':process.pid}, stream)
+    code = process.wait()
+except BaseException:
+    try: os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError: pass
+    process.wait()
+    raise
+finally:
+    if record.exists():
+        data = json.loads(record.read_text(encoding='utf-8'))
+        if data.get('token') == token: record.unlink()
+sys.exit(code if code >= 0 else 128 - code)
+"""
+_STOP_CODE = """import json, os, pathlib, signal, sys, time
+record, token = pathlib.Path(sys.argv[1]), sys.argv[2]
+if not record.exists(): sys.exit(0)
+data = json.loads(record.read_text(encoding='utf-8'))
+if data.get('token') != token: raise RuntimeError('Compile owner token mismatch')
+pid = int(data['pid'])
+if pid <= 1: raise RuntimeError('Invalid compile process group')
+proc = pathlib.Path('/proc') / str(pid)
+try: environment = (proc / 'environ').read_bytes().split(b'\\0')
+except FileNotFoundError: sys.exit(0)
+if ('BEVFUSION_COMPILE_ID=' + token).encode() not in environment:
+    raise RuntimeError('Compile process identity changed; refusing cleanup')
+if os.getpgid(pid) != pid: raise RuntimeError('Compiler is not its own process-group leader')
+os.killpg(pid, signal.SIGTERM)
+for _ in range(50):
+    if not proc.exists(): sys.exit(0)
+    time.sleep(.1)
+try:
+    environment = (proc / 'environ').read_bytes().split(b'\\0')
+    if ('BEVFUSION_COMPILE_ID=' + token).encode() not in environment or os.getpgid(pid) != pid:
+        raise RuntimeError('Compile identity changed while waiting; refusing forced cleanup')
+    os.killpg(pid, signal.SIGKILL)
+except (FileNotFoundError, ProcessLookupError): pass
+"""
+
+
+def _stop_compiler(prefix, env, python_path, pid_path, token, log_stream):
+    command = prefix + env + [python_path, "-c", _STOP_CODE, pid_path, token]
+    _print_command(command)
+    try:
+        subprocess.run(command, stdout=log_stream, stderr=subprocess.STDOUT, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log_stream.write(f"Compiler process-group cleanup failed: {exc}\n")
+
+
 def compile_hbm(onnx_path, output_dir, inputs, calibration_dirs, *, march="nash-p", image=None,
                 wsl_distro=DEFAULT_WSL_DISTRO, precision="float16", optimize_level="O0", jobs=4,
-                timeout_seconds=600, dry_run=False, project_root=None):
-    """Write an OE PTQ configuration and compile with a bounded Docker lifetime.
+                timeout_seconds=600, dry_run=False, project_root=None, python_path=None):
+    """Compile with hb_compile from the selected Linux Conda environment.
 
-    Paths must resolve inside ROOT (including symlink targets). Inputs describe
-    fixed logical ONNX tensors; calibration_dirs contains one directory of NPY
-    samples per input, with equal sample counts. Integer index tensors remain
-    integer inputs; ``precision`` chooses node computation, not physical HBM I/O.
-    Existing helper outputs/build artifacts are never overwritten. A successful
-    return requires both compiler exit zero and the expected nonempty HBM file.
-    Runtime errors are returned and persisted; invalid contracts raise ValueError.
-    ``timeout_seconds=0`` disables both the container and host wait budgets.
+    Source/calibration/output paths stay project-owned and unchanged. Logical
+    integer inputs retain their dtype. A successful result requires exit zero
+    and the expected nonempty HBM file. Zero timeout disables both budgets.
     """
     import yaml
 
@@ -180,20 +273,20 @@ def compile_hbm(onnx_path, output_dir, inputs, calibration_dirs, *, march="nash-
         raise ValueError("timeout_seconds must be a nonnegative integer; 0 disables the time budget")
     if not isinstance(dry_run, bool):
         raise ValueError("dry_run must be bool")
-    image, windows, prefix = _runtime(image, wsl_distro)
+    python_path, windows, prefix, env = _runtime(image, wsl_distro, python_path)
     root = Path(project_root).expanduser().resolve() if project_root is not None else ROOT.resolve()
     if not root.is_dir():
         raise ValueError("project_root must be an existing directory")
     contract = _input_contract(inputs)
-    onnx_path, container_onnx = _owned_path(onnx_path, "onnx_path", root)
-    output_dir, container_output = _owned_path(output_dir, "output_dir", root)
+    onnx_path, relative_onnx = _owned_path(onnx_path, "onnx_path", root)
+    output_dir, relative_output = _owned_path(output_dir, "output_dir", root)
     if not onnx_path.is_file() or onnx_path.suffix.lower() != ".onnx":
         raise ValueError("onnx_path must point to an existing .onnx file")
     if not isinstance(calibration_dirs, (list, tuple)) or len(calibration_dirs) != len(contract):
         raise ValueError("calibration_dirs must provide exactly one directory per input")
-    calibration_paths, container_calibration, sample_counts = [], [], []
+    calibration_paths, relative_calibration, sample_counts = [], [], []
     for index, value in enumerate(calibration_dirs):
-        path, container_path = _owned_path(value, f"calibration_dirs[{index}]", root)
+        path, relative = _owned_path(value, f"calibration_dirs[{index}]", root)
         if not path.is_dir():
             raise ValueError(f"Calibration directory does not exist: {path}")
         samples = sorted(path.glob("*.npy"))
@@ -201,10 +294,10 @@ def compile_hbm(onnx_path, output_dir, inputs, calibration_dirs, *, march="nash-
             raise ValueError(f"Calibration directory must contain nonempty NPY samples: {path}")
         for sample in samples:
             _owned_path(sample, "calibration sample", root)
-        if ";" in container_path or "\n" in container_path or "\r" in container_path:
+        if any(char in relative for char in (";", "\n", "\r")):
             raise ValueError("Calibration paths cannot contain semicolons/newlines")
         calibration_paths.append(path)
-        container_calibration.append(container_path)
+        relative_calibration.append(relative)
         sample_counts.append(len(samples))
     if len(set(sample_counts)) != 1:
         raise ValueError("Calibration input directories must contain equal NPY sample counts")
@@ -214,89 +307,86 @@ def compile_hbm(onnx_path, output_dir, inputs, calibration_dirs, *, march="nash-
         raise ValueError("Refusing to overwrite existing OE configuration, log, result or build directory")
     if output_dir.exists() and not output_dir.is_dir():
         raise ValueError("output_dir must be a directory")
-    container_build = PurePosixPath(container_output, "oe_build").as_posix()
-    container_config = PurePosixPath(container_output, config_path.name).as_posix()
-    model_prefix = onnx_path.stem
+    runtime_root, estimated = _runtime_root(root, windows, prefix, dry_run)
+    runtime_onnx = PurePosixPath(runtime_root, relative_onnx).as_posix()
+    runtime_output = PurePosixPath(runtime_root, relative_output)
+    runtime_calibration = [PurePosixPath(runtime_root, value).as_posix() for value in relative_calibration]
     config = {
-        "model_parameters": {"onnx_model": container_onnx, "march": march,
-                             "working_dir": container_build, "output_model_file_prefix": model_prefix},
+        "model_parameters": {"onnx_model": runtime_onnx, "march": march,
+            "working_dir": (runtime_output / "oe_build").as_posix(), "output_model_file_prefix": onnx_path.stem},
         "input_parameters": {"input_name": ";".join(item["name"] for item in contract),
-                             "input_shape": ";".join("x".join(map(str, item["shape"])) for item in contract),
-                             "input_type_rt": ";".join("featuremap" for _ in contract),
-                             "input_type_train": ";".join("featuremap" for _ in contract)},
-        "calibration_parameters": {"cal_data_dir": ";".join(container_calibration),
-                                   "calibration_type": "max",
-                                   "quant_config": {"model_config": {"all_node_type": precision}}},
+            "input_shape": ";".join("x".join(map(str, item["shape"])) for item in contract),
+            "input_type_rt": ";".join("featuremap" for _ in contract),
+            "input_type_train": ";".join("featuremap" for _ in contract)},
+        "calibration_parameters": {"cal_data_dir": ";".join(runtime_calibration), "calibration_type": "max",
+            "quant_config": {"model_config": {"all_node_type": precision}}},
         "compiler_parameters": {"compile_mode": "latency", "core_num": 1,
-                                "optimize_level": optimize_level, "jobs": jobs},
+            "optimize_level": optimize_level, "jobs": jobs},
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     with config_path.open("x", encoding="utf-8", newline="\n") as stream:
         yaml.safe_dump(config, stream, sort_keys=False, allow_unicode=True)
+    token = uuid.uuid4().hex
+    pid_path = (runtime_output / (".compile-" + token + ".pid.json")).as_posix()
+    compiler_command = ["timeout", "--signal=TERM", "--kill-after=10s", f"{timeout_seconds}s",
+                        "hb_compile", "-c", (runtime_output / config_path.name).as_posix()]
+    command = prefix + env + [python_path, "-c", _RUNNER_CODE, pid_path, token] + compiler_command
     started = time.perf_counter()
-    result = {"status": "preparing", "image": image, "march": march, "precision": precision,
-              "inputs": contract, "calibration_dirs": [str(path) for path in calibration_paths],
-              "calibration_samples": sample_counts[0], "config_path": str(config_path),
-              "log_path": str(log_path), "result_path": str(result_path), "build_dir": str(build_dir),
-              "hbm_path": None, "hbm_generated": False, "hbm_compiled": False,
-              "stage": "preparing", "board_verified": False,
-              "quantized_accuracy_verified": False, "dry_run": dry_run}
-    container_name = "bevfusion-oe-" + uuid.uuid4().hex[:12]
+    result = {"status": "preparing", "backend": "wsl-conda" if windows else "linux-conda",
+              "runtime_python": python_path, "runtime_root": runtime_root, "runtime_root_estimated": estimated,
+              "march": march, "precision": precision, "inputs": contract,
+              "calibration_dirs": [str(path) for path in calibration_paths], "calibration_samples": sample_counts[0],
+              "config_path": str(config_path), "log_path": str(log_path), "result_path": str(result_path),
+              "build_dir": str(build_dir), "hbm_path": None, "hbm_generated": False, "hbm_compiled": False,
+              "stage": "preparing", "board_verified": False, "quantized_accuracy_verified": False,
+              "dry_run": dry_run, "command": command, "compiler_command": compiler_command}
     try:
         if not dry_run:
-            environment = detect(image=image, wsl_distro=wsl_distro)
+            environment = detect(wsl_distro=wsl_distro, python_path=python_path)
             result["environment"] = environment
             if not environment["available"]:
                 result.update(status="unavailable", error=environment["reason"])
                 return result
-        mount_source, estimated = _mount_source(root, windows, prefix, dry_run)
-        if "," in mount_source:
-            raise ValueError("Docker bind source cannot contain commas with this --mount interface")
-        command = prefix + ["docker", "run", "--rm", "--pull", "never", "--name", container_name, "--network", "none",
-                            "--mount", f"type=bind,source={mount_source},target=/workspace",
-                            "--workdir", "/workspace", image,
-                            "timeout", "--signal=TERM", "--kill-after=10s", f"{timeout_seconds}s",
-                            "hb_compile", "-c", container_config]
-        result.update(command=command, mount_source=mount_source, mount_source_estimated=estimated)
+        invocation_label = "[planned compiler invocation; not executed]" if dry_run else "[compiler invocation]"
+        print(invocation_label + " " + _format_command(prefix + env + compiler_command), flush=True)
+        result["command_display"] = _print_command(command, dry_run=dry_run)
+        print(f"[compiler config] {config_path}", flush=True)
+        print(f"[compiler log] {log_path}", flush=True)
         if dry_run:
             result["status"] = "dry_run"
             return result
         with log_path.open("x", encoding="utf-8", newline="\n") as stream:
-            stream.write(json.dumps({"command": command}, ensure_ascii=False) + "\n")
+            stream.write(json.dumps({"command": command, "compiler_command": compiler_command}, ensure_ascii=False) + "\n")
             stream.flush()
             try:
                 process = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
-                                         timeout=timeout_seconds + 45 if timeout_seconds else None, check=False)
+                    timeout=timeout_seconds + 45 if timeout_seconds else None, check=False)
                 result["returncode"] = process.returncode
                 result["status"] = "timeout" if process.returncode == 124 else "failed"
             except subprocess.TimeoutExpired:
                 result.update(status="timeout", returncode=124, error="Host compilation wait budget expired")
-                _stop_container(prefix, container_name, stream)
+                _stop_compiler(prefix, env, python_path, pid_path, token, stream)
             except KeyboardInterrupt:
                 result.update(status="interrupted", error="Compilation interrupted")
-                _stop_container(prefix, container_name, stream)
+                _stop_compiler(prefix, env, python_path, pid_path, token, stream)
                 raise
         result.update(_artifacts(build_dir))
-        expected_hbm = build_dir / (model_prefix + ".hbm")
-        if expected_hbm.is_file() and expected_hbm.stat().st_size > 0:
-            result.update(hbm_path=str(expected_hbm), hbm_generated=True)
+        expected = build_dir / (onnx_path.stem + ".hbm")
+        if expected.is_file() and expected.stat().st_size > 0:
+            result.update(hbm_path=str(expected), hbm_generated=True)
         if result.get("returncode") == 0:
             result["status"] = "compiled" if result["hbm_generated"] else "failed"
             if not result["hbm_generated"]:
                 result["error"] = "Compiler exited zero without producing the expected nonempty HBM"
         elif result["status"] == "failed":
-            result["error"] = ("Compiler/container was killed (137); memory exhaustion or external termination "
-                               "is possible, but timeout is not established"
-                               if result.get("returncode") == 137 else
-                               f"OE compiler exited with code {result.get('returncode')}")
+            result["error"] = ("Compiler was killed (137); memory exhaustion or external termination is possible, "
+                "but timeout is not established" if result.get("returncode") == 137 else
+                f"OE compiler exited with code {result.get('returncode')}")
         elif result["status"] == "timeout":
             result.setdefault("error", f"OE compilation exceeded its {timeout_seconds}-second budget")
         if log_path.is_file():
-            warnings = []
-            with log_path.open(encoding="utf-8", errors="replace") as stream:
-                for line in stream:
-                    if "Failed to generate node info" in line:
-                        warnings.append(line.strip())
+            warnings = [line.strip() for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                        if "Failed to generate node info" in line]
             if warnings:
                 result["compiler_report_warnings"] = warnings
         return result
@@ -305,8 +395,8 @@ def compile_hbm(onnx_path, output_dir, inputs, calibration_dirs, *, march="nash-
         return result
     finally:
         result["hbm_compiled"] = result["status"] == "compiled" and result["hbm_generated"]
-        result["stage"] = ("complete" if result["hbm_compiled"] else
-                           "dry_run" if dry_run else "environment" if result["status"] == "unavailable" else "compile")
+        result["stage"] = ("complete" if result["hbm_compiled"] else "dry_run" if dry_run else
+                           "environment" if result["status"] == "unavailable" else "compile")
         if result.get("error"):
             result["reason"] = result["error"]
         result["elapsed_seconds"] = time.perf_counter() - started
@@ -318,12 +408,3 @@ def compile_hbm(onnx_path, output_dir, inputs, calibration_dirs, *, march="nash-
         with result_path.open("x", encoding="utf-8", newline="\n") as stream:
             json.dump(result, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
-
-
-def _stop_container(prefix, name, log_stream):
-    """Clean up only the container created for this invocation."""
-    try:
-        subprocess.run(prefix + ["docker", "stop", "--timeout", "5", name], stdout=log_stream,
-                       stderr=subprocess.STDOUT, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log_stream.write(f"Container cleanup failed: {exc}\n")

@@ -15,7 +15,7 @@ from itertools import product
 import torch
 from torch import nn
 
-from bevfusion.lidar import ReferenceSparseConv, SparseState, keys
+from bevfusion.operators.sparse_conv.reference import ReferenceSparseConv, SparseState, keys
 
 
 _SENTINEL = 1 << 62

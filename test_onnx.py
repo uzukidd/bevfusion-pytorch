@@ -1,7 +1,7 @@
 """ONNX Runtime version of test.py, with the same input and visualization flow.
 
 中文：读取张量或六张 PNG + BIN，预处理后执行 ONNX，保存预测并用 Matplotlib 展示。
-Both tasks accept dynamic five-input or explicitly fixed-calibration HAT two-input models.
+Both tasks accept dynamic, fixed-calibration and compatible LiDAR input contracts.
 """
 import argparse
 from datetime import datetime
@@ -114,17 +114,23 @@ def prepare_feed(sample):
 
 
 def validate_fixed_calibration(metadata):
-    """Validate bound K/extrinsic/augmentation for a two-input HAT graph.
+    """Validate bound K/extrinsic/augmentation for a two-input fixed graph.
 
     Return detached FP32 NumPy matrices. Fixed calibration is checked against
     every prepared sample before dropping those matrices from the ORT feed.
     """
-    if metadata.get("calibration_mode") != "fixed" or metadata.get("pool_backend") != "hat":
-        raise ValueError("Two-input ONNX requires calibration_mode='fixed' and pool_backend='hat' metadata")
-    count = metadata.get("pool_num_points")
-    if (not isinstance(count, str) or not count.isascii() or not count.isdecimal()
-            or not 1 <= int(count) <= 1024):
-        raise ValueError("Fixed-calibration HAT ONNX requires pool_num_points metadata in [1,1024]")
+    backend = metadata.get("pool_backend")
+    allowed = ("reference", "hat", "compatible") if metadata.get("lidar_backend") == "compatible" else ("reference", "hat")
+    if metadata.get("calibration_mode") != "fixed" or backend not in allowed:
+        raise ValueError("Fixed-calibration ONNX requires a supported pool_backend and calibration_mode='fixed'")
+    if backend in ("reference", "compatible"):
+        if metadata.get("pooling_precomputed") != "true":
+            raise ValueError(f"Fixed-calibration {backend} ONNX requires pooling_precomputed='true' metadata")
+    else:
+        count = metadata.get("pool_num_points")
+        if (not isinstance(count, str) or not count.isascii() or not count.isdecimal()
+                or not 1 <= int(count) <= 1024):
+            raise ValueError("Fixed-calibration HAT ONNX requires pool_num_points metadata in [1,1024]")
     try:
         bound = json.loads(metadata["fixed_calibration"])
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -145,14 +151,36 @@ def validate_fixed_calibration(metadata):
     return matrices
 
 
+def _compatible_input_contract(session):
+    """Check the runtime plan ABI before per-frame preprocessing or ORT run."""
+    from tools.onnx_compatible import validate_compatible_metadata
+    records = validate_compatible_metadata(_metadata(session))["inputs"]
+    actual = session.get_inputs()
+    if [value.name for value in actual] != [item["name"] for item in records]:
+        raise ValueError("Compatible LiDAR ONNX input names/order differ from metadata")
+    for item, value in zip(records, actual):
+        name, shape, dtype = item["name"], item["shape"], item["dtype"]
+        if value.type != {"int32": "tensor(int32)", "float32": "tensor(float)"}[dtype]:
+            raise ValueError(f"Compatible LiDAR {name} must have dtype {dtype}")
+        actual_shape = getattr(value, "shape", None)
+        if (actual_shape is None or len(actual_shape) != len(shape) or any(
+                fixed is not None and (not isinstance(found, (int, np.integer)) or found != fixed)
+                for found, fixed in zip(actual_shape, shape))):
+            raise ValueError(f"Compatible LiDAR {name} shape differs from metadata")
+    return records
+
+
 def session_input_contract(session):
-    """Accept legacy five-input graphs or metadata-bound two-input HAT graphs."""
+    """Accept dynamic/fixed sensor graphs and explicitly declared compatible plans."""
+    if _metadata(session).get("lidar_backend") == "compatible":
+        _compatible_input_contract(session)
+        return validate_fixed_calibration(_metadata(session)) if _metadata(session).get("calibration_mode") == "fixed" else None
     inputs = session.get_inputs()
     names = [value.name for value in inputs]
     if (len(names) != len(set(names)) or any(value.type != "tensor(float)" for value in inputs)
             or not ((len(names) == 5 and set(names) == set(INPUT_NAMES))
                     or (len(names) == 2 and set(names) == set(FIXED_INPUT_NAMES)))):
-        raise ValueError("Expected an FP32 five-input ONNX or fixed-calibration HAT two-input ONNX")
+        raise ValueError("Expected an FP32 five-input ONNX or fixed-calibration two-input ONNX")
     for value in inputs:
         _check_shape(value, INPUT_SHAPES[value.name])
     if len(names) == 2:
@@ -178,10 +206,48 @@ def select_session_feed(session, feed):
                     or not np.allclose(matrix.numpy(), expected, atol=1e-6, rtol=1e-6)):
                 raise ValueError(f"Runtime calibration {name} differs from fixed ONNX calibration; "
                                  "re-export the model for the changed calibration")
+    if _metadata(session).get("lidar_backend") == "compatible":
+        from tools.onnx_compatible import prepare_compatible_feed
+        selected = prepare_compatible_feed(_metadata(session), feed)
+        records = _compatible_input_contract(session)
+        if not isinstance(selected, dict) or list(selected) != [item["name"] for item in records]:
+            raise ValueError("Compatible preprocessing produced a different input contract")
+        for item in records:
+            value = selected[item["name"]]
+            if (not isinstance(value, np.ndarray) or value.dtype != np.dtype(item["dtype"])
+                    or value.ndim != len(item["shape"]) or any(
+                        fixed is not None and found != fixed for found, fixed in zip(value.shape, item["shape"]))
+                    or not np.isfinite(value).all()):
+                raise ValueError(f"Invalid compatible runtime input: {item['name']}")
+        return selected
     return {value.name: feed[value.name] for value in session.get_inputs()}
 
 
-def create_session(model_path, *, device="cpu", threads=8):
+def validate_cuda_options(cuda_conv_algo="DEFAULT", cuda_mem_limit_mb=None):
+    """Validate explicit ORT CUDA choices, including for CPU-only callers."""
+    if cuda_conv_algo not in ("DEFAULT", "HEURISTIC", "EXHAUSTIVE"):
+        raise ValueError("cuda_conv_algo must be DEFAULT, HEURISTIC or EXHAUSTIVE")
+    if (cuda_mem_limit_mb is not None and (isinstance(cuda_mem_limit_mb, bool)
+            or not isinstance(cuda_mem_limit_mb, int) or cuda_mem_limit_mb < 1)):
+        raise ValueError("cuda_mem_limit_mb must be a positive integer or None")
+
+
+def cuda_session_kwargs(args):
+    """Forward only explicit overrides so existing default callers stay unchanged."""
+    algorithm = getattr(args, "cuda_conv_algo", "DEFAULT")
+    memory = getattr(args, "cuda_mem_limit_mb", None)
+    validate_cuda_options(algorithm, memory)
+    result = {}
+    if algorithm != "DEFAULT":
+        result["cuda_conv_algo"] = algorithm
+    if memory is not None:
+        result["cuda_mem_limit_mb"] = memory
+    return result
+
+
+def create_session(model_path, *, device="cpu", threads=8,
+                   cuda_conv_algo="DEFAULT", cuda_mem_limit_mb=None):
+    validate_cuda_options(cuda_conv_algo, cuda_mem_limit_mb)
     if threads < 1:
         raise ValueError("threads must be positive")
     provider = {"cpu": "CPUExecutionProvider", "cuda": "CUDAExecutionProvider"}.get(device)
@@ -197,13 +263,16 @@ def create_session(model_path, *, device="cpu", threads=8):
         # Each sparse-search Loop owns a subgraph session. Default per-subgraph
         # CUDA streams retain separate cuDNN/cuBLAS handles and can exhaust GPU
         # resources. Reuse the EP stream/handles across all subgraphs instead.
-        # The 180x180 detection fuser can otherwise select a cuDNN tactic
-        # requesting >40 GiB workspace on Blackwell. Use ORT's bounded-workspace
-        # selection instead of exhausting a 16 GiB device during the first Conv.
-        providers = [(provider, {"use_ep_level_unified_stream": "1", "use_tf32": "0",
-                                 "cudnn_conv_use_max_workspace": "0",
-                                 "cudnn_conv_algo_search": "DEFAULT"}),
-                     "CPUExecutionProvider"]
+        # Keep DEFAULT unless explicitly overridden: other selections previously
+        # requested >40 GiB for the 180x180 detection fuser on Blackwell. Neither
+        # the workspace option below nor gpu_mem_limit is a hard cap on all
+        # cuDNN allocations, especially with the cuDNN 9 execution-plan path.
+        cuda_options = {"use_ep_level_unified_stream": "1", "use_tf32": "0",
+                        "cudnn_conv_use_max_workspace": "0",
+                        "cudnn_conv_algo_search": cuda_conv_algo}
+        if cuda_mem_limit_mb is not None:
+            cuda_options["gpu_mem_limit"] = str(cuda_mem_limit_mb * 1024 * 1024)
+        providers = [(provider, cuda_options), "CPUExecutionProvider"]
     session = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
     if device == "cuda" and "CUDAExecutionProvider" not in session.get_providers():
         raise ValueError("CUDA provider could not initialize; check ONNX Runtime CUDA dependencies")
@@ -270,6 +339,10 @@ def parse_args(argv=None):
     parser.add_argument("--fifth-column", choices=("ring", "time-lag"), default="ring")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda", help="ONNX Runtime provider; default CUDA")
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--cuda-conv-algo", choices=("DEFAULT", "HEURISTIC", "EXHAUSTIVE"), default="DEFAULT",
+                        help="ORT cuDNN convolution algorithm selection; DEFAULT preserves current behavior")
+    parser.add_argument("--cuda-mem-limit-mb", type=int,
+                        help="ORT GPU allocator limit in MiB; not a hard cap on cuDNN workspace or total GPU memory")
     parser.add_argument("--classes", nargs="+", help="Optional class names in ONNX output channel order")
     parser.add_argument("--save-inputs", type=Path, help="Save the original loaded sensor/calibration dictionary")
     parser.add_argument("--output", type=Path, help="Optionally save predictions and classes to a new .pt file")
@@ -281,6 +354,10 @@ def parse_args(argv=None):
     parser.add_argument("--no-show", action="store_true", help="Save the figure using Agg without a GUI window")
     parser.add_argument("--no-visualization", action="store_true", help="Do not import Matplotlib")
     args = parser.parse_args(argv)
+    try:
+        validate_cuda_options(args.cuda_conv_algo, args.cuda_mem_limit_mb)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.inputs and (args.image_files or args.lidar_file):
         parser.error("--image-files and --lidar-file require --samples")
     if not args.model.is_file() or args.model.suffix.lower() != ".onnx":
@@ -326,8 +403,13 @@ def main(argv=None):
     print("input points:", feed["points"].shape, feed["points"].dtype)
     print("[load] ONNX:", args.model, flush=True)
     try:
-        session = create_session(args.model, device=args.device, threads=args.threads)
+        session = create_session(args.model, device=args.device, threads=args.threads, **cuda_session_kwargs(args))
+        compatible = _metadata(session).get("lidar_backend") == "compatible"
+        preprocessing_started = time.perf_counter() if compatible else None
         feed = select_session_feed(session, feed)
+        if compatible:
+            preprocessing_seconds = time.perf_counter() - preprocessing_started
+            print(f"compatible LiDAR CPU planning: {preprocessing_seconds:.3f} s (outside ONNX timing)", flush=True)
         task = infer_task(session)
         if task == "seg" and args.score_threshold is not None:
             raise ValueError("--score-threshold is only supported for detection ONNX post-inference filtering")

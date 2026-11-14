@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$script_dir/.."
 entry=test_det.py
-env_name="${BEVFUSION_CONDA_ENV:-vla-supervised}"
+env_name="${BEVFUSION_CONDA_ENV:-bevfusion-pytorch}"
 case "${env_name,,}" in
     base|root|default|*/*|*\\*) printf 'Select an existing non-base named Conda environment.\n' >&2; exit 1 ;;
 esac

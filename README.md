@@ -28,7 +28,7 @@
 	or
 
     ```bash
-    python test_seg.py - --checkpoint data/checkpoints/bevfusion-seg.pth --samples data/samples --device cuda --backend auto --no-show
+    python test_seg.py --checkpoint data/checkpoints/bevfusion-seg.pth --samples data/samples --device cuda --backend auto --no-show
     ```
 
 See `.\test_det.py` and `.\test_seg.py`   for more details.

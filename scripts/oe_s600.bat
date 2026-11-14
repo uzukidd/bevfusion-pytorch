@@ -8,7 +8,8 @@ if errorlevel 1 (
 )
 pushd "%~dp0.."
 if errorlevel 1 exit /b 1
-wsl.exe --distribution %OE_WSL_DISTRO% --user root --exec bash scripts/oe_s600.sh %*
+rem Commands run in the WSL bevfusion-pytorch Conda environment.
+wsl.exe --distribution %OE_WSL_DISTRO% --exec bash scripts/oe_s600.sh %*
 set "OE_RESULT=%errorlevel%"
 popd
 exit /b %OE_RESULT%

@@ -16,8 +16,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .compatible_pooling import _GatherInt32, _concat
-from .lidar import ReferenceSparseConv, SparseBlock, SparseSequence
+from ..pooling.compatible import _GatherInt32, _concat
+from .reference import ReferenceSparseConv, SparseBlock, SparseSequence
 
 
 def _capacity(value, name):

@@ -99,7 +99,7 @@ def atan2(y, x):
 def _fixed_calibration(calibration, device):
     """Clone the explicit six-camera contract; never synthesize calibration."""
     if not isinstance(calibration, tuple) or len(calibration) != 3:
-        raise ValueError("HAT ONNX pooling requires fixed_calibration=(K, camera2lidar, img_aug_matrix)")
+        raise ValueError("ONNX precomputed pooling requires fixed_calibration=(K, camera2lidar, img_aug_matrix)")
     result = []
     for value, name, size in zip(calibration, ("camera_intrinsics", "camera2lidar", "img_aug_matrix"), (3, 4, 4)):
         if not isinstance(value, torch.Tensor) or tuple(value.shape) != (1, 6, size, size):
@@ -111,6 +111,57 @@ def _fixed_calibration(calibration, device):
             raise ValueError(f"fixed {name} must be homogeneous with last row [0,0,0,1]")
         result.append(value)
     return tuple(result)
+
+
+class _OnnxReferencePool(nn.Module):
+    """All-contribution reference pooling with geometry-only constant indices.
+
+    Keep each source camera/depth chunk and its original valid-point ordering.
+    New depth probabilities and image features are gathered on every invocation;
+    only geometry-derived indices are retained. Scatter-add preserves duplicate
+    cell contributions without the ONNX duplicate-index caveat of index_add_.
+    """
+    def __init__(self, transform, calibration):
+        super().__init__()
+        from bevfusion.operators.pooling.reference import build_pool_plan
+
+        intrinsic, extrinsic, augmentation = calibration
+        with torch.no_grad():
+            geometry = transform.get_geometry(extrinsic, intrinsic, augmentation,
+                                              torch.eye(4, device=intrinsic.device)[None])
+            coordinates = transform._voxel_indices(geometry)
+            plan = build_pool_plan(coordinates, tuple(int(value) for value in transform.nx),
+                                   transform.pool_depth_chunk)
+        self.shape, self.batch_size, self.pixels = plan.shape, plan.batch_size, plan.pixels
+        self.channels = int(transform.C)
+        self.chunks = tuple((chunk.batch, chunk.camera, chunk.start, chunk.end)
+                            for chunk in plan.chunks)
+        self.valid_points = sum(chunk.indices.numel() for chunk in plan.chunks)
+        for index, chunk in enumerate(plan.chunks):
+            self.register_buffer(f"indices_{index}", chunk.indices.detach().clone())
+            self.register_buffer(f"ranks_{index}", chunk.ranks.detach().clone())
+
+    def statistics(self):
+        return {"backend": "reference", "precomputed": True, "approximate": False,
+                "operator": "Gather/Mul/ScatterElements(add)", "groups": len(self.chunks),
+                "chunks": len(self.chunks), "valid_points": self.valid_points,
+                "selected_points": self.valid_points, "dropped_points": 0,
+                "grid_shape": list(self.shape), "normalization": "none",
+                "index_bytes": sum(value.numel() * value.element_size() for value in self.buffers())}
+
+    def forward(self, depth, features):
+        nx, ny, nz = self.shape
+        volume = nz * nx * ny
+        output = features.new_zeros((self.batch_size * volume, self.channels), dtype=torch.float32)
+        image_features = features.flatten(3).permute(0, 1, 3, 2)
+        for index, (batch, camera, start, end) in enumerate(self.chunks):
+            selected = getattr(self, f"indices_{index}")
+            ranks = getattr(self, f"ranks_{index}") + batch * volume
+            probability = depth[batch, camera, start:end].reshape(-1)[selected]
+            values = probability[:, None] * image_features[batch, camera][selected % self.pixels]
+            output = output.scatter_add(0, ranks[:, None].expand(-1, self.channels), values.float())
+        return output.reshape(self.batch_size, nz, nx, ny, self.channels).permute(0, 1, 4, 2, 3).reshape(
+            self.batch_size, nz * self.channels, nx, ny)
 
 
 class OnnxCamera(nn.Module):
@@ -127,18 +178,22 @@ class OnnxCamera(nn.Module):
         self.bev_shape = tuple(int(value) for value in self.vtransform.nx)
         self.depth_conditioned = hasattr(self.vtransform, "dtransform")
         self.pool_backend = pool_backend
+        self.fixed_calibration = pool_backend == "hat" or fixed_calibration is not None
         self.pool = None
-        if pool_backend == "hat":
-            from bevfusion.hat_pooling import HATLSSPool
+        if self.fixed_calibration:
             intrinsic, extrinsic, augmentation = _fixed_calibration(
                 fixed_calibration, self.vtransform.frustum.device)
             for name, value in zip(("fixed_camera_intrinsics", "fixed_camera2lidar", "fixed_img_aug_matrix"),
                                    (intrinsic, extrinsic, augmentation)):
                 self.register_buffer(name, value)
             with torch.no_grad():
-                self.pool = HATLSSPool.from_transform(
-                    self.vtransform, extrinsic, intrinsic, augmentation,
-                    torch.eye(4, device=intrinsic.device)[None], num_points=pool_num_points)
+                if pool_backend == "hat":
+                    from bevfusion.operators.pooling.hat import HATLSSPool
+                    self.pool = HATLSSPool.from_transform(
+                        self.vtransform, extrinsic, intrinsic, augmentation,
+                        torch.eye(4, device=intrinsic.device)[None], num_points=pool_num_points)
+                else:
+                    self.pool = _OnnxReferencePool(self.vtransform, (intrinsic, extrinsic, augmentation))
 
     def forward(self, images, camera_intrinsics, camera2lidar, img_aug_matrix, points=None):
         vt = self.vtransform
@@ -146,13 +201,13 @@ class OnnxCamera(nn.Module):
         feature = self.neck(self.backbone(images.reshape(-1, 3, *vt.image_size)))[0]
         _, channels, height, width = feature.shape
         feature = feature.reshape(1, num_cameras, channels, height, width)
-        if self.pool_backend == "hat":
+        if self.fixed_calibration:
             if not (torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()):
                 for value, bound in zip((camera_intrinsics, camera2lidar, img_aug_matrix),
                                          (self.fixed_camera_intrinsics, self.fixed_camera2lidar,
                                           self.fixed_img_aug_matrix)):
                     if tuple(value.shape) != tuple(bound.shape) or not torch.equal(value, bound):
-                        raise ValueError("HAT camera calibration differs from its fixed sampling geometry; rebuild the wrapper")
+                        raise ValueError(f"{self.pool_backend} camera calibration differs from its fixed sampling geometry; rebuild the wrapper")
         else:
             frustum = vt.frustum.float()[None, None]
             post_rot, post_trans = img_aug_matrix[..., :3, :3], img_aug_matrix[..., :3, 3]
@@ -174,7 +229,7 @@ class OnnxCamera(nn.Module):
             flat_feature = torch.cat((depth_feature, flat_feature), dim=1)
         prediction = vt.depthnet(flat_feature).reshape(1, num_cameras, vt.D + vt.C, height, width)
         depth, channels = prediction[:, :, :vt.D].softmax(2), prediction[:, :, vt.D:]
-        if self.pool_backend == "hat":
+        if self.fixed_calibration:
             return vt.downsample(self.pool(depth, channels).contiguous())
         nx, ny, nz = self.bev_shape
         out = feature.new_zeros((nz * nx * ny, vt.C), dtype=torch.float32)
@@ -334,7 +389,8 @@ class OnnxBEVFusion(nn.Module):
 
     Segmentation keeps its single probability tensor. Detection returns
     (boxes_3d[N,9], scores[N], labels[N]), with a dynamic final box count.
-    Geometry and projection are computed from runtime inputs, bypassing caches.
+    Geometry is dynamic unless a fixed-calibration pooling plan is supplied.
+    Raw-point voxelization, sparse searches and detection depth stay dynamic.
     """
     def __init__(self, model, score_threshold=None, *, pool_backend="reference",
                  pool_num_points=10, fixed_calibration=None):
@@ -373,15 +429,15 @@ class OnnxBEVFusion(nn.Module):
 
 
 class FixedCalibrationOnnxBEVFusion(OnnxBEVFusion):
-    """Two runtime inputs (images, points), with explicit bound HAT geometry.
+    """Two runtime inputs (images, points), with explicitly bound pool geometry.
 
     The fixed original-image intrinsics, camera-to-LiDAR and image augmentation
     matrices are cloned FP32 buffers. Rebuild/export after calibration changes.
     LiDAR still uses the dynamic standard ONNX adapter (Unique and Loop); this
     wrapper does not establish whole-model BPU compatibility.
     """
-    def __init__(self, model, calibration, score_threshold=None, pool_num_points=10):
-        super().__init__(model, score_threshold, pool_backend="hat",
+    def __init__(self, model, calibration, score_threshold=None, pool_num_points=10, *, pool_backend="hat"):
+        super().__init__(model, score_threshold, pool_backend=pool_backend,
                          pool_num_points=pool_num_points, fixed_calibration=calibration)
         for name in ("camera_intrinsics", "camera2lidar", "img_aug_matrix"):
             self.register_buffer(name, getattr(self.camera, "fixed_" + name).detach().clone())

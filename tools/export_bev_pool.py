@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 from bevfusion.base import _camera_matrix
 from bevfusion.camera import LSSTransform
 from bevfusion.depth import DepthLSSTransform
-from bevfusion.pooling import build_pool_plan, pool_with_plan
+from bevfusion.operators.pooling.reference import build_pool_plan, pool_with_plan
 from bevfusion.preprocessing import preprocess_images
 from bevfusion.sample_io import load_calibration
 
@@ -406,7 +406,7 @@ def main(argv=None):
         calibration, source = resolve_calibration(args)
     except (ValueError, OSError, KeyError, TypeError) as exc:
         parser.error(str(exc))
-    from bevfusion.compatible_pooling import CompatibleBEVPool
+    from bevfusion.operators.pooling.compatible import CompatibleBEVPool
     import onnx
 
     started = time.perf_counter()
@@ -417,7 +417,7 @@ def main(argv=None):
             calibration["img_aug_matrix"], calibration["lidar_aug_matrix"]))
         grid_shape = tuple(int(value) for value in transform.nx)
         if args.pool_backend == "hat":
-            from bevfusion.hat_pooling import HATLSSPool
+            from bevfusion.operators.pooling.hat import HATLSSPool
             module = HATLSSPool.from_transform(transform, calibration["camera2lidar"],
                 calibration["camera_intrinsics"], calibration["img_aug_matrix"],
                 calibration["lidar_aug_matrix"], num_points=args.num_points).eval()

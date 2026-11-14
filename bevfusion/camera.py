@@ -220,8 +220,8 @@ class LSSTransform(nn.Module):
     def __init__(self, image_size=(256, 704), pool_depth_chunk=16, pool_backend="reference",
                  precompute=True, pool_num_points=10):
         super().__init__()
-        if pool_backend not in ("reference", "cuda", "auto", "compatible", "horizon", "hat"):
-            raise ValueError("pool_backend must be reference, cuda, auto, compatible, horizon or hat")
+        if pool_backend not in ("reference", "cuda", "auto", "compatible", "horizon", "hat", "hat_plugin"):
+            raise ValueError("pool_backend must be reference, cuda, auto, compatible, horizon, hat or hat_plugin")
         from .configuration import validate_pool_num_points
         self.pool_num_points = validate_pool_num_points(pool_num_points)
         self.pool_backend = pool_backend
@@ -284,7 +284,7 @@ class LSSTransform(nn.Module):
         return super().train(mode)
 
     def _get_bev_plan(self, camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix):
-        from .pooling import build_pool_plan
+        from .operators.pooling.reference import build_pool_plan
 
         matrices = (camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix)
         geometry_values = (*matrices, self.dx, self.bx, self.nx)
@@ -297,7 +297,7 @@ class LSSTransform(nn.Module):
         # inference tensors, which do not have a usable tensor version counter.
         values = torch.cat([t.detach().reshape(-1).double() for t in geometry_values])
         cache = self._bev_cache
-        retain_plan = self.precompute_enabled or self.pool_backend not in ("compatible", "horizon", "hat")
+        retain_plan = self.precompute_enabled or self.pool_backend not in ("compatible", "horizon", "hat", "hat_plugin")
         if retain_plan and cache is not None and cache[0] == metadata:
             same = torch.stack(((values == cache[1]).all(),
                                 (self.frustum.detach() == cache[2]).all())).all().item()
@@ -311,16 +311,20 @@ class LSSTransform(nn.Module):
         coordinates = self._voxel_indices(geometry)
         shape = tuple(int(value) for value in self.nx)
         if self.pool_backend == "compatible":
-            from .compatible_pooling import CompatibleBEVPool
+            from .operators.pooling.compatible import CompatibleBEVPool
             # Keep runtime indices inside the ordinary cache tuple, outside the
             # model module/state_dict tree, exactly like the native pool plan.
             plan = CompatibleBEVPool(coordinates, shape, self.C).to(device=self.frustum.device)
         elif self.pool_backend == "hat":
-            from .hat_pooling import HATLSSPool
+            from .operators.pooling.hat import HATLSSPool
             plan = HATLSSPool(coordinates, shape, self.C, num_points=self.pool_num_points).to(
                 device=self.frustum.device)
+        elif self.pool_backend == "hat_plugin":
+            from .operators.pooling.hat_plugin import HATPluginLSSPool
+            plan = HATPluginLSSPool(coordinates, shape, self.C, num_points=self.pool_num_points).to(
+                device=self.frustum.device)
         elif self.pool_backend == "horizon":
-            from .horizon_pooling import HorizonBEVPool
+            from .operators.pooling.horizon import HorizonBEVPool
             plan = HorizonBEVPool(coordinates, shape, self.C).to(device=self.frustum.device)
         else:
             plan = build_pool_plan(coordinates, shape, self.pool_depth_chunk)
@@ -332,9 +336,11 @@ class LSSTransform(nn.Module):
     def _pool_predictions(self, depth, features, camera2lidar, camera_intrinsics,
                           img_aug_matrix, lidar_aug_matrix):
         matrices = (camera2lidar, camera_intrinsics, img_aug_matrix, lidar_aug_matrix)
-        if self.pool_backend in ("compatible", "horizon", "hat"):
+        if self.pool_backend in ("compatible", "horizon", "hat", "hat_plugin"):
             if self.training or torch.is_grad_enabled():
                 raise RuntimeError(f"{self.pool_backend} pooling is inference-only; use eval() and inference_mode()")
+            if self.pool_backend == "hat_plugin" and (torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()):
+                raise RuntimeError("Export a prebuilt HATPluginLSSPool with the Horizon HBIR exporter; standard ONNX export is unsupported")
             if self.pool_backend == "compatible" and (torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()):
                 raise RuntimeError("Export compatible pooling explicitly with tools/export_bev_pool.py")
             if self.pool_backend == "hat" and (torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()):
@@ -346,7 +352,7 @@ class LSSTransform(nn.Module):
         # is insufficient. Bypass for gradients, training, tracing and ONNX export.
         if (self.precompute_enabled and not self.training and not torch.is_grad_enabled()
                 and not torch.jit.is_tracing() and not torch.onnx.is_in_onnx_export()):
-            from .pooling import pool_with_plan
+            from .operators.pooling.reference import pool_with_plan
             return pool_with_plan(self._get_bev_plan(*matrices), depth, features, self.pool_backend)
         geometry = self.get_geometry(*matrices)
         coords = self._voxel_indices(geometry)

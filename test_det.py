@@ -5,6 +5,10 @@ from datetime import datetime
 from pathlib import Path
 import time
 
+if __name__ == "__main__":
+    from tools.horizon_runtime import ensure_plugin_loader
+    ensure_plugin_loader()
+
 import torch
 
 from bevfusion import BEVFusionDet, OBJECT_CLASSES
@@ -19,12 +23,12 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, help="Optional detection YAML, e.g. config/convfuser.yaml")
     parser.add_argument("--backend", choices=("auto", "reference", "cuda"), default="auto",
                         help="Default operator backend; overridden by --lidar-backend or --pool-backend")
-    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference", "horizon", "hat"), default=None,
-                        help="Camera pooling override; horizon requires the WSL horizon_plugin_pytorch wheel")
+    parser.add_argument("--pool-backend", choices=("compatible", "auto", "cuda", "reference", "horizon", "hat", "hat_plugin"), default=None,
+                        help="Camera pooling override; horizon/hat_plugin require horizon_plugin_pytorch; hat_plugin uses native sampling")
     parser.add_argument("--pool-num-points", type=int, default=None,
-                        help="HAT pooling samples per BEV cell, integer in [1,1024]; default: config or 10")
-    parser.add_argument("--lidar-backend", choices=("compatible", "auto", "cuda", "reference"), default=None,
-                        help="LiDAR voxelization/sparse encoder only; compatible uses CPU geometry and tensor computation")
+                        help="HAT/hat_plugin pooling samples per BEV cell, integer in [1,1024]; default: config or 10")
+    parser.add_argument("--lidar-backend", choices=("compatible", "auto", "cuda", "reference", "hybrid"), default=None,
+                        help="LiDAR backend; hybrid retains SubMConv and uses tiled Conv3D for ordinary sparse convs")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--calibration", type=Path, help="Original-image calibration JSON/PT; defaults to samples/calibration.json")
     parser.add_argument("--image-files", nargs=6, metavar="PNG", help="Six paths relative to --samples, in camera/calibration order")

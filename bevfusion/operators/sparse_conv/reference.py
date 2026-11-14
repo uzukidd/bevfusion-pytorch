@@ -2,6 +2,7 @@
 
 The reference backend uses Torch gather/GEMM; CUDA/auto use the separately
 installed spconv extension with the same parameter tensors and checkpoint keys.
+Hybrid keeps submanifold CUDA/auto behavior and tiles ordinary convs as Conv3D.
 """
 from dataclasses import dataclass, field
 from itertools import product
@@ -88,9 +89,13 @@ class ReferenceSparseConv(nn.Module):
             )
         device = state.features.device
         backend = getattr(self, "backend", "reference")
+        if backend == "hybrid" and not self.subm:
+            from .conv3d import tiled_sparse_conv3d
+            return tiled_sparse_conv3d(state, self.weight, self.stride, self.padding,
+                                       getattr(self, "hybrid_tile_size", 16))
         if backend == "cuda" and device.type != "cuda":
             raise ValueError("The cuda backend requires CUDA tensors")
-        if device.type == "cuda" and backend in ("auto", "cuda"):
+        if device.type == "cuda" and backend in ("auto", "cuda", "hybrid"):
             try:
                 return self._forward_cuda(state)
             except (ImportError, OSError) as exc:
@@ -175,11 +180,14 @@ def convmodule(cin,cout,kernel=3,stride=1,padding=0,subm=False):
 
 
 class ReferenceSparseEncoder(nn.Module):
-    """Shared checkpoint-compatible encoder with reference or installed CUDA ops."""
-    def __init__(self, sparse_shape=(1024, 1024, 41), backend="reference"):
+    """Checkpoint-compatible encoder with reference, CUDA, or hybrid execution."""
+    def __init__(self, sparse_shape=(1024, 1024, 41), backend="reference", hybrid_tile_size=16):
         super().__init__()
-        if backend not in ("reference", "cuda", "auto"):
-            raise ValueError("backend must be reference, cuda or auto")
+        if backend not in ("reference", "cuda", "auto", "hybrid"):
+            raise ValueError("backend must be reference, cuda, auto or hybrid")
+        if (isinstance(hybrid_tile_size, bool) or not isinstance(hybrid_tile_size, int)
+                or hybrid_tile_size <= 0):
+            raise ValueError("hybrid_tile_size must be a positive integer")
         self.sparse_shape = tuple(sparse_shape)
         self.backend = backend
         self.conv_input=convmodule(5,16,padding=1,subm=True)
@@ -193,6 +201,7 @@ class ReferenceSparseEncoder(nn.Module):
         for module in self.modules():
             if isinstance(module, ReferenceSparseConv):
                 module.backend = backend
+                module.hybrid_tile_size = hybrid_tile_size
 
     def forward(self,features,coords,verbose=True):
         if features.shape[0] == 0:

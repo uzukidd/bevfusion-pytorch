@@ -9,7 +9,7 @@ from .camera import NativeCameraEncoder
 from .configuration import load_detection_config, resolve_pool_backend, resolve_pool_num_points
 from .depth import DepthLSSTransform
 from .detection_head import OBJECT_CLASSES, TransFusionHead
-from .lidar import ReferenceSparseEncoder
+from .operators.sparse_conv.reference import ReferenceSparseEncoder
 
 FORMAT = "bevfusion-det-v1"
 
@@ -31,8 +31,8 @@ class BEVFusionDet(BEVFusionBase):
         if camera_batch_size < 0 or pool_depth_chunk < 1:
             raise ValueError("camera_batch_size must be >=0 and pool_depth_chunk must be >0")
         resolved_lidar_backend = backend if lidar_backend is None else lidar_backend
-        if resolved_lidar_backend not in ("reference", "auto", "cuda", "compatible"):
-            raise ValueError("lidar_backend must be reference, auto, cuda or compatible")
+        if resolved_lidar_backend not in ("reference", "auto", "cuda", "compatible", "hybrid"):
+            raise ValueError("lidar_backend must be reference, auto, cuda, compatible or hybrid")
         resolved = load_detection_config(config)
         resolved_pool_backend = resolve_pool_backend(pool_backend, resolved["operators"]["bev_pool"], backend)
         resolved_pool_num_points = resolve_pool_num_points(

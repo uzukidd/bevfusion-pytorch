@@ -204,7 +204,7 @@ def plan_sparse_encoder(original_backbone, coords, capacities=None, input_capaci
     Identical subm topology with equal capacities shares a plan object inside
     this call only. Every invocation derives its plans from the current coords.
     """
-    from .lidar import ReferenceSparseConv, SparseBlock, SparseSequence
+    from .reference import ReferenceSparseConv, SparseBlock, SparseSequence
 
     if not hasattr(original_backbone, "sparse_shape"):
         raise ValueError("original_backbone must expose sparse_shape")

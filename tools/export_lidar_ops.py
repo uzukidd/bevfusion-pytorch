@@ -21,12 +21,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bevfusion import BEVFusionDet, BEVFusionSeg
-from bevfusion.compatible_sparse import CompatibleSparseEncoder
-from bevfusion.compatible_voxel import CompatibleVoxelMean, build_voxel_plan
-from bevfusion.lidar import ReferenceSparseConv
+from bevfusion.operators.sparse_conv.compatible import CompatibleSparseEncoder
+from bevfusion.operators.voxelization.compatible import CompatibleVoxelMean, build_voxel_plan
+from bevfusion.operators.sparse_conv.reference import ReferenceSparseConv
 from bevfusion.preprocessing import prepare_points, voxelize
 from bevfusion.sample_io import read_lidar_bin
-from bevfusion.sparse_plan import plan_sparse_encoder
+from bevfusion.operators.sparse_conv.plan import plan_sparse_encoder
 from tools.export_bev_pool import inspect_graph
 
 VOXEL_INPUT_NAMES = ["points", "point_indices", "inverse_counts"]

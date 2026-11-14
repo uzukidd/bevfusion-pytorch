@@ -51,19 +51,22 @@ def parse_args(argv=None):
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="PyTorch graph export device")
     parser.add_argument("--verify-device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--no-verify", action="store_true", help="Skip ORT checks; source-adapter parity still required")
-    parser.add_argument("--export-only", action="store_true", help="Generate and verify ONNX, inputs and OE config without invoking Docker")
+    parser.add_argument("--export-only", action="store_true", help="Generate and verify ONNX, inputs and OE config without invoking the Conda compiler")
     parser.add_argument("--dry-run", action="store_true", help="Alias of --export-only; compiler invocation is recorded only")
     parser.add_argument("--precision", choices=("float16", "int16", "int8"), default="int16")
     parser.add_argument("--optimize-level", choices=("O0", "O1", "O2"), default="O0")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--compile-timeout", type=int, default=600, help="Compiler seconds; 0 disables its time limit")
-    parser.add_argument("--oe-image", default=None, help="Existing OE Docker image; never pulled automatically")
-    parser.add_argument("--wsl-distro", default="Ubuntu-26.04")
+    parser.add_argument("--oe-image", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--wsl-distro", default="Ubuntu-26.04", help="WSL distribution used by Windows HBM compilation")
+    parser.add_argument("--hbm-python", help="Absolute Linux Conda Python for HBM compilation; default bevfusion-pytorch")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--atol", type=float, default=1e-3)
     parser.add_argument("--rtol", type=float, default=1e-3)
     parser.add_argument("--output-dir", type=Path, help="New bundle directory; default outputs/hbm_export/<checkpoint>_<timestamp>")
     args = parser.parse_args(argv)
+    if args.oe_image is not None:
+        parser.error("--oe-image is no longer supported; use the bevfusion-pytorch Conda environment (--hbm-python)")
     if args.calibration is not None and args.inputs is not None:
         parser.error("--calibration applies to --samples; PT inputs carry their own calibration")
     if args.samples is None and args.inputs is None:
@@ -90,7 +93,7 @@ def parse_args(argv=None):
     try:
         args.output_dir.relative_to(ROOT)
     except ValueError:
-        parser.error("--output-dir must be inside the project so the existing OE mount can access it")
+        parser.error("--output-dir must be inside the project so the WSL compiler can access it")
     return parser, args
 
 
@@ -327,7 +330,7 @@ def run(args):
             del session
         report["stage"] = "oe_compile"
         compiled = compile_hbm(onnx_path, args.output_dir, contracts["inputs"], calibration_dirs,
-            march="nash-p", image=args.oe_image, wsl_distro=args.wsl_distro,
+            march="nash-p", image=args.oe_image, wsl_distro=args.wsl_distro, python_path=getattr(args, "hbm_python", None),
             precision=args.precision, optimize_level=args.optimize_level, jobs=args.jobs,
             timeout_seconds=args.compile_timeout, dry_run=args.export_only or args.dry_run)
         report["compile"] = compiled

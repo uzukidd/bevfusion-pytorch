@@ -99,7 +99,7 @@ class _ShapeValues:
                     shape_attrs = _attributes(source)
                     start = shape_attrs["start"].i if "start" in shape_attrs else 0
                     end = shape_attrs["end"].i if "end" in shape_attrs else len(shape)
-                    selected = np.take(np.asarray(shape[start:end], dtype=object), indices.astype(np.int64), axis=0)
+                    selected = np.asarray(np.take(np.asarray(shape[start:end], dtype=object), indices.astype(np.int64), axis=0))
                     if all(value is not None for value in selected.reshape(-1)):
                         return np.asarray(selected, dtype=np.int64)
         values = [self.get(name) if name else None for name in node.input]

@@ -43,8 +43,8 @@ class BEVFusionBase(nn.Module):
             raise ValueError("backend must be reference, cuda or auto")
         self.backend = backend
         self.lidar_backend = backend if lidar_backend is None else lidar_backend
-        if self.lidar_backend not in ("reference", "auto", "cuda", "compatible"):
-            raise ValueError("lidar_backend must be reference, auto, cuda or compatible")
+        if self.lidar_backend not in ("reference", "auto", "cuda", "compatible", "hybrid"):
+            raise ValueError("lidar_backend must be reference, auto, cuda, compatible or hybrid")
         self.voxel_size = tuple(voxel_size)
         self.point_cloud_range = tuple(point_cloud_range)
         self.max_voxels = max_voxels
@@ -133,7 +133,8 @@ class BEVFusionBase(nn.Module):
         else:
             features, coords = voxelize(
                 points, max_voxels=self.max_voxels, voxel_size=self.voxel_size,
-                point_cloud_range=self.point_cloud_range, backend=self.lidar_backend)
+                point_cloud_range=self.point_cloud_range,
+                backend="auto" if self.lidar_backend == "hybrid" else self.lidar_backend)
             lidar_bev = self.encoders["lidar"]["backbone"](features, coords, verbose=False)
         camera_bev = self._camera_features(images, points, intrinsic, extrinsic, augmentation)
         if camera_bev.shape[-2:] != lidar_bev.shape[-2:]:
